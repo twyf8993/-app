@@ -1,23 +1,58 @@
 name: Build APK
+
 on:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - run: unzip -q ShortDramaShell.zip -d work
+
+      - name: Find and extract ZIP
+        shell: bash
+        run: |
+          mapfile -t zips < <(
+            find . -path ./.git -prune -o -type f -iname '*.zip' -print
+          )
+
+          if [ "${#zips[@]}" -ne 1 ]; then
+            echo "错误：仓库中必须恰好有一个 ZIP 文件，实际找到 ${#zips[@]} 个"
+            exit 1
+          fi
+
+          echo "解压：${zips[0]}"
+          unzip -q "${zips[0]}" -d work
+
+          mapfile -t projects < <(
+            find work -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n'
+          )
+
+          if [ "${#projects[@]}" -ne 1 ]; then
+            echo "错误：ZIP 中必须恰好有一个 Gradle 项目，实际找到 ${#projects[@]} 个"
+            exit 1
+          fi
+
+          echo "项目目录：${projects[0]}"
+          echo "PROJECT_DIR=${projects[0]}" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
-      - name: Build
-        working-directory: work/ShortDramaShell
-        run: gradle assembleDebug --stacktrace
+          gradle-version: '8.9'
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
-          path: work/ShortDramaShell/app/build/outputs/apk/debug/*.apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
