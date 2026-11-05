@@ -1,0 +1,3349 @@
+# 拾光影视 · 手机上传用的单文件构建配置
+# 放到仓库的 .github/workflows/android.yml，提交后 GitHub 会先生成全部源码，再构建 APK 并发布到 Releases。
+name: Build Shiguang Video
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Generate project config and resources
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+
+          f settings.gradle.kts <<'__EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "ShiguangVideo"
+          include(":app")
+          __EOF__
+
+          f build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.1.0" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.1.0" apply false
+          }
+          __EOF__
+
+          f gradle.properties <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __EOF__
+
+          f app/build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.shiguang.video"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.shiguang.video"
+                  minSdk = 24
+                  targetSdk = 35
+                  // CI 通过 -PversionCode / -PversionName 传入构建序号，保证新包能覆盖安装
+                  versionCode = (findProperty("versionCode") as String?)?.toIntOrNull() ?: 1
+                  versionName = (findProperty("versionName") as String?) ?: "0.1.0"
+              }
+
+              signingConfigs {
+                  // CI 会生成并缓存固定的调试签名；本地没有该文件时沿用默认调试签名
+                  getByName("debug") {
+                      val ks = rootProject.file("keystore/debug.jks")
+                      if (ks.exists()) {
+                          storeFile = ks
+                          storePassword = "android"
+                          keyAlias = "androiddebugkey"
+                          keyPassword = "android"
+                      }
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.12.01")
+              implementation(composeBom)
+
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+              implementation("androidx.navigation:navigation-compose:2.8.5")
+
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-core")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+
+              implementation("androidx.media3:media3-exoplayer:1.5.1")
+              implementation("androidx.media3:media3-ui:1.5.1")
+
+              testImplementation("junit:junit:4.13.2")
+          }
+          __EOF__
+
+          f app/proguard-rules.pro <<'__EOF__'
+          # 第一阶段未开启混淆，预留文件。
+          __EOF__
+
+          f app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:name=".ShiguangApp"
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.Shiguang">
+
+                  <!-- 全屏播放时会切换横竖屏，声明 configChanges 避免 Activity 重建打断播放 -->
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          __EOF__
+
+          f app/src/main/res/values/strings.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">拾光影视</string>
+          </resources>
+          __EOF__
+
+          f app/src/main/res/values/themes.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="window_bg">#FF0B0B0F</color>
+              <color name="ic_launcher_bg">#FF1A1A22</color>
+
+              <style name="Theme.Shiguang" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/window_bg</item>
+                  <item name="android:statusBarColor">@android:color/transparent</item>
+                  <item name="android:navigationBarColor">@android:color/transparent</item>
+              </style>
+          </resources>
+          __EOF__
+
+          f app/src/main/res/drawable/ic_launcher_foreground.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFE8505B"
+                  android:pathData="M34,38h40a6,6 0,0 1,6 6v22a6,6 0,0 1,-6 6h-40a6,6 0,0 1,-6 -6v-22a6,6 0,0 1,6 -6z" />
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M48,46l14,9l-14,9z" />
+          </vector>
+          __EOF__
+
+          f app/src/main/res/drawable/ic_launcher.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FF1A1A22"
+                  android:pathData="M54,4a50,50 0,1 1,0 100a50,50 0,1 1,0 -100z" />
+              <path
+                  android:fillColor="#FFE8505B"
+                  android:pathData="M34,38h40a6,6 0,0 1,6 6v22a6,6 0,0 1,-6 6h-40a6,6 0,0 1,-6 -6v-22a6,6 0,0 1,6 -6z" />
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M48,46l14,9l-14,9z" />
+          </vector>
+          __EOF__
+
+          f app/src/main/res/drawable-anydpi-v26/ic_launcher.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          __EOF__
+
+      - name: Generate data layer
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/data/Models.kt <<'__EOF__'
+          package com.shiguang.video.data
+
+          enum class ContentType(val label: String) {
+              SHORT_DRAMA("短剧"),
+              MOVIE("电影"),
+              ANIME("漫剧"),
+          }
+
+          data class Drama(
+              val id: String,
+              val title: String,
+              val type: ContentType,
+              val genres: List<String>,
+              val year: Int,
+              val region: String,
+              val episodeCount: Int,
+              /** 热度，单位：万 */
+              val heat: Int,
+              val score: Double,
+              val updatedDaysAgo: Int,
+              val completed: Boolean,
+              val intro: String,
+              /** 决定程序生成海报的配色与纹理，不使用任何真实海报 */
+              val posterSeed: Int,
+          ) {
+              val heatText: String get() = "${heat}万热度"
+
+              val episodeText: String
+                  get() = when {
+                      type == ContentType.MOVIE -> "电影"
+                      completed -> "全${episodeCount}集"
+                      else -> "更新至${episodeCount}集"
+                  }
+          }
+
+          data class TestVideo(
+              val title: String,
+              val url: String,
+              val credit: String,
+          )
+
+          data class Episode(
+              val dramaId: String,
+              val number: Int,
+              val title: String,
+              val video: TestVideo,
+          )
+          __EOF__
+
+          f $S/data/TestVideos.kt <<'__EOF__'
+          package com.shiguang.video.data
+
+          /**
+           * 测试视频：Blender 基金会开放电影，按 Creative Commons 署名协议授权，可在注明出处的前提下使用。
+           * 托管地址是 Google 公开的示例存储桶，仅用于开发验证；正式环境请换成自有 CDN。
+           */
+          object TestVideos {
+              private const val BASE = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/"
+
+              val all: List<TestVideo> = listOf(
+                  TestVideo(
+                      title = "Big Buck Bunny",
+                      url = BASE + "BigBuckBunny.mp4",
+                      credit = "Big Buck Bunny © 2008 Blender Foundation · CC BY 3.0 · peach.blender.org",
+                  ),
+                  TestVideo(
+                      title = "Elephants Dream",
+                      url = BASE + "ElephantsDream.mp4",
+                      credit = "Elephants Dream © 2006 Blender Foundation · CC BY 2.5 · orange.blender.org",
+                  ),
+                  TestVideo(
+                      title = "Sintel",
+                      url = BASE + "Sintel.mp4",
+                      credit = "Sintel © 2010 Blender Foundation · CC BY 3.0 · durian.blender.org",
+                  ),
+                  TestVideo(
+                      title = "Tears of Steel",
+                      url = BASE + "TearsOfSteel.mp4",
+                      credit = "Tears of Steel © 2012 Blender Foundation · CC BY 3.0 · mango.blender.org",
+                  ),
+              )
+          }
+          __EOF__
+
+          f $S/data/MockCatalog.kt <<'__EOF__'
+          package com.shiguang.video.data
+
+          /** 第一阶段的模拟片库。片名、简介均为原创虚构内容。 */
+          object MockCatalog {
+
+              val dramas: List<Drama> = listOf(
+                  Drama(
+                      id = "d01", title = "雾港来信", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("悬疑", "都市"), year = 2026, region = "内地",
+                      episodeCount = 60, heat = 386, score = 8.7, updatedDaysAgo = 0, completed = false,
+                      intro = "海港小城接连收到二十年前寄出的信件，邮局新人林微顺着邮戳追查，发现每封信都指向一桩被遗忘的旧案。",
+                      posterSeed = 3,
+                  ),
+                  Drama(
+                      id = "d02", title = "星河便利店", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("甜宠", "奇幻"), year = 2026, region = "内地",
+                      episodeCount = 48, heat = 352, score = 8.4, updatedDaysAgo = 1, completed = true,
+                      intro = "只在午夜营业的便利店，货架上卖的是客人遗失的回忆。夜班店员与一位总在凌晨三点出现的顾客，慢慢拼出彼此的过去。",
+                      posterSeed = 7,
+                  ),
+                  Drama(
+                      id = "d03", title = "长安小厨娘", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("古装", "喜剧"), year = 2025, region = "内地",
+                      episodeCount = 72, heat = 410, score = 8.9, updatedDaysAgo = 2, completed = true,
+                      intro = "现代美食博主意外来到长安西市，靠一口铁锅和满脑子菜谱，从街边小摊一路做到御膳房。",
+                      posterSeed = 11,
+                  ),
+                  Drama(
+                      id = "d04", title = "回到九八开面馆", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("年代", "家庭"), year = 2026, region = "内地",
+                      episodeCount = 80, heat = 298, score = 8.2, updatedDaysAgo = 0, completed = false,
+                      intro = "中年失意的陈建国一觉醒来回到 1998 年，他决定守住父亲的老面馆，也守住那个差点散掉的家。",
+                      posterSeed = 2,
+                  ),
+                  Drama(
+                      id = "d05", title = "替身新娘不干了", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("甜宠", "都市"), year = 2026, region = "内地",
+                      episodeCount = 56, heat = 333, score = 7.9, updatedDaysAgo = 3, completed = true,
+                      intro = "婚礼当天，替姐出嫁的苏晚当众摘下头纱：这场联姻我不替了。没想到新郎比她更想退婚。",
+                      posterSeed = 5,
+                  ),
+                  Drama(
+                      id = "d06", title = "山海守夜人", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("奇幻", "古装"), year = 2025, region = "内地",
+                      episodeCount = 64, heat = 275, score = 8.5, updatedDaysAgo = 6, completed = true,
+                      intro = "守夜人一脉世代看守山海之间的结界，最后一位传人却是个怕黑的少年。",
+                      posterSeed = 9,
+                  ),
+                  Drama(
+                      id = "d07", title = "外卖骑手的第二人生", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("都市", "喜剧"), year = 2026, region = "内地",
+                      episodeCount = 40, heat = 241, score = 8.0, updatedDaysAgo = 1, completed = false,
+                      intro = "每送完一单，骑手周野就能看见顾客未来二十四小时的一个片段。他开始一边送餐一边救人。",
+                      posterSeed = 4,
+                  ),
+                  Drama(
+                      id = "d08", title = "镜中侦探社", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("悬疑", "奇幻"), year = 2025, region = "内地",
+                      episodeCount = 36, heat = 219, score = 8.6, updatedDaysAgo = 9, completed = true,
+                      intro = "老宅里的一面镜子能映出案发现场。落魄侦探和镜中的“另一个自己”联手破案。",
+                      posterSeed = 14,
+                  ),
+                  Drama(
+                      id = "d09", title = "云端之上的约定", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("甜宠", "剧情"), year = 2026, region = "内地",
+                      episodeCount = 30, heat = 188, score = 7.8, updatedDaysAgo = 4, completed = true,
+                      intro = "空管员与机长每天在无线电里斗嘴，直到一次特情让两人第一次见面。",
+                      posterSeed = 6,
+                  ),
+                  Drama(
+                      id = "d10", title = "我在县城当首富", type = ContentType.SHORT_DRAMA,
+                      genres = listOf("都市", "喜剧"), year = 2026, region = "内地",
+                      episodeCount = 66, heat = 365, score = 7.6, updatedDaysAgo = 2, completed = false,
+                      intro = "被大厂裁员的程序员回老家创业，从帮二姨开网店开始，把整个县城的土特产卖向全国。",
+                      posterSeed = 12,
+                  ),
+                  Drama(
+                      id = "m01", title = "第七号站台", type = ContentType.MOVIE,
+                      genres = listOf("科幻", "悬疑"), year = 2026, region = "内地",
+                      episodeCount = 1, heat = 156, score = 8.3, updatedDaysAgo = 5, completed = true,
+                      intro = "末班地铁停靠在一座不存在的站台，车上七名乘客必须在天亮前找出谁不属于这个时间。",
+                      posterSeed = 1,
+                  ),
+                  Drama(
+                      id = "m02", title = "北纬三十度的夏天", type = ContentType.MOVIE,
+                      genres = listOf("家庭", "剧情"), year = 2025, region = "内地",
+                      episodeCount = 1, heat = 132, score = 8.8, updatedDaysAgo = 12, completed = true,
+                      intro = "高考结束的那个夏天，少女独自骑行去寻找离家多年的外公。",
+                      posterSeed = 8,
+                  ),
+                  Drama(
+                      id = "m03", title = "无声追击", type = ContentType.MOVIE,
+                      genres = listOf("动作", "悬疑"), year = 2026, region = "香港",
+                      episodeCount = 1, heat = 201, score = 7.7, updatedDaysAgo = 3, completed = true,
+                      intro = "一名听障女警凭借读唇术，在嘈杂的跨年夜锁定了潜伏在人群中的劫匪。",
+                      posterSeed = 13,
+                  ),
+                  Drama(
+                      id = "a01", title = "灵猫茶馆", type = ContentType.ANIME,
+                      genres = listOf("奇幻", "治愈"), year = 2026, region = "国创",
+                      episodeCount = 24, heat = 176, score = 9.0, updatedDaysAgo = 0, completed = false,
+                      intro = "一只会泡茶的三花猫在山脚开了间茶馆，来喝茶的有书生、狐妖，也有迷路的星星。",
+                      posterSeed = 10,
+                  ),
+                  Drama(
+                      id = "a02", title = "机甲少女零号", type = ContentType.ANIME,
+                      genres = listOf("科幻", "动作"), year = 2025, region = "国创",
+                      episodeCount = 12, heat = 143, score = 8.1, updatedDaysAgo = 7, completed = true,
+                      intro = "废土城市里，修理工少女捡到一台失去记忆的旧式机甲，它只记得一个坐标。",
+                      posterSeed = 15,
+                  ),
+                  Drama(
+                      id = "a03", title = "仙门扫地僧", type = ContentType.ANIME,
+                      genres = listOf("奇幻", "喜剧"), year = 2026, region = "国创",
+                      episodeCount = 20, heat = 228, score = 8.4, updatedDaysAgo = 1, completed = false,
+                      intro = "仙门里扫了三百年地的杂役，其实是全宗门最不想被人发现的高手。",
+                      posterSeed = 0,
+                  ),
+                  Drama(
+                      id = "a04", title = "月光邮差", type = ContentType.ANIME,
+                      genres = listOf("治愈", "剧情"), year = 2025, region = "国创",
+                      episodeCount = 13, heat = 98, score = 9.1, updatedDaysAgo = 15, completed = true,
+                      intro = "在月亮背面送信的小邮差，每晚替地球上的人们把说不出口的话送达。",
+                      posterSeed = 16,
+                  ),
+                  Drama(
+                      id = "a05", title = "剑与稻田", type = ContentType.ANIME,
+                      genres = listOf("古装", "奇幻"), year = 2026, region = "国创",
+                      episodeCount = 16, heat = 121, score = 8.0, updatedDaysAgo = 4, completed = false,
+                      intro = "退隐的剑客只想安心种田，可每到收获季，总有人上门挑战。",
+                      posterSeed = 17,
+                  ),
+              )
+
+              val genres: List<String> = dramas.flatMap { it.genres }.distinct()
+
+              val hotKeywords: List<String> = listOf("雾港来信", "长安小厨娘", "悬疑", "甜宠", "灵猫茶馆", "首富", "第七号站台", "穿越")
+
+              fun find(id: String): Drama? = dramas.firstOrNull { it.id == id }
+
+              fun episode(drama: Drama, number: Int): Episode {
+                  val videos = TestVideos.all
+                  val video = videos[(drama.posterSeed + number - 1).mod(videos.size)]
+                  val title = if (drama.type == ContentType.MOVIE) "正片" else "第${number}集"
+                  return Episode(drama.id, number, title, video)
+              }
+
+              fun search(query: String): List<Drama> {
+                  val q = query.trim()
+                  if (q.isEmpty()) return emptyList()
+                  return dramas
+                      .filter { d ->
+                          d.title.contains(q, ignoreCase = true) ||
+                              d.genres.any { it.contains(q) } ||
+                              d.type.label.contains(q) ||
+                              d.intro.contains(q)
+                      }
+                      .sortedWith(
+                          compareByDescending<Drama> { it.title.contains(q, ignoreCase = true) }
+                              .thenByDescending { it.heat },
+                      )
+              }
+
+              fun related(drama: Drama, limit: Int = 8): List<Drama> =
+                  dramas
+                      .filter { it.id != drama.id }
+                      .sortedByDescending { other -> other.genres.count { it in drama.genres } * 1000 + other.heat }
+                      .take(limit)
+          }
+          __EOF__
+
+          f $S/data/Progress.kt <<'__EOF__'
+          package com.shiguang.video.data
+
+          data class EpisodeProgress(
+              val episode: Int,
+              val positionMs: Long,
+              val durationMs: Long,
+              val updatedAt: Long,
+          ) {
+              val fraction: Float
+                  get() = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+
+              val finished: Boolean
+                  get() = ProgressPolicy.isFinished(positionMs, durationMs)
+          }
+
+          data class DramaProgress(
+              val dramaId: String,
+              /** 最近一次播放的集数 */
+              val lastEpisode: Int,
+              val episodes: Map<Int, EpisodeProgress>,
+              val updatedAt: Long,
+          ) {
+              val last: EpisodeProgress? get() = episodes[lastEpisode]
+          }
+
+          /** 观看进度相关的判定规则，不依赖 Android，便于单元测试。 */
+          object ProgressPolicy {
+              /** 播放比例达到该值即视为看完 */
+              const val FINISH_FRACTION = 0.95f
+
+              /** 距离结尾不足该时长也视为看完（片尾字幕） */
+              const val FINISH_TAIL_MS = 8_000L
+
+              /** 进度太靠前时直接从头播，不做续播 */
+              const val MIN_RESUME_MS = 3_000L
+
+              fun isFinished(positionMs: Long, durationMs: Long): Boolean {
+                  if (durationMs <= 0) return false
+                  if (positionMs.toFloat() / durationMs >= FINISH_FRACTION) return true
+                  // 很短的视频不套用片尾规则，否则一开播就会被判定为看完
+                  return durationMs > FINISH_TAIL_MS * 4 && durationMs - positionMs <= FINISH_TAIL_MS
+              }
+
+              fun resumePositionMs(progress: EpisodeProgress?): Long = when {
+                  progress == null -> 0L
+                  progress.finished -> 0L
+                  progress.positionMs < MIN_RESUME_MS -> 0L
+                  else -> progress.positionMs
+              }
+
+              /** “继续观看”应打开哪一集：上次那集已看完且还有下一集时，直接进入下一集。 */
+              fun episodeToContinue(progress: DramaProgress?, episodeCount: Int): Int {
+                  if (progress == null || episodeCount <= 0) return 1
+                  val last = progress.last
+                  return if (last != null && last.finished && progress.lastEpisode < episodeCount) {
+                      progress.lastEpisode + 1
+                  } else {
+                      progress.lastEpisode.coerceIn(1, episodeCount)
+                  }
+              }
+          }
+
+          fun formatDuration(ms: Long): String {
+              val total = (ms / 1000).coerceAtLeast(0)
+              val h = total / 3600
+              val m = (total % 3600) / 60
+              val s = total % 60
+              return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+          }
+          __EOF__
+
+      - name: Generate storage, app entry and theme
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/data/Repositories.kt <<'__EOF__'
+          package com.shiguang.video.data
+
+          import android.content.Context
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.update
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /**
+           * 本地观看进度。每部剧一条 JSON 记录，内存中以 StateFlow 暴露，界面自动刷新。
+           * 后续接入账号体系时，可在这里增加与服务端的同步。
+           */
+          class WatchProgressRepository(context: Context) {
+
+              private val prefs = context.getSharedPreferences("watch_progress", Context.MODE_PRIVATE)
+              private val _all = MutableStateFlow(loadAll())
+              val all: StateFlow<Map<String, DramaProgress>> = _all.asStateFlow()
+
+              fun get(dramaId: String): DramaProgress? = _all.value[dramaId]
+
+              fun episode(dramaId: String, episode: Int): EpisodeProgress? = get(dramaId)?.episodes?.get(episode)
+
+              fun save(
+                  dramaId: String,
+                  episode: Int,
+                  positionMs: Long,
+                  durationMs: Long,
+                  now: Long = System.currentTimeMillis(),
+              ) {
+                  val old = get(dramaId)
+                  val knownDuration = if (durationMs > 0) durationMs else old?.episodes?.get(episode)?.durationMs ?: 0L
+                  val entry = EpisodeProgress(episode, positionMs.coerceAtLeast(0L), knownDuration, now)
+                  val updated = DramaProgress(
+                      dramaId = dramaId,
+                      lastEpisode = episode,
+                      episodes = old?.episodes.orEmpty() + (episode to entry),
+                      updatedAt = now,
+                  )
+                  _all.update { it + (dramaId to updated) }
+                  prefs.edit().putString(KEY_PREFIX + dramaId, encode(updated)).apply()
+              }
+
+              fun remove(dramaId: String) {
+                  _all.update { it - dramaId }
+                  prefs.edit().remove(KEY_PREFIX + dramaId).apply()
+              }
+
+              fun clear() {
+                  val editor = prefs.edit()
+                  _all.value.keys.forEach { editor.remove(KEY_PREFIX + it) }
+                  editor.apply()
+                  _all.value = emptyMap()
+              }
+
+              private fun loadAll(): Map<String, DramaProgress> =
+                  prefs.all
+                      .filterKeys { it.startsWith(KEY_PREFIX) }
+                      .mapNotNull { (_, value) -> (value as? String)?.let(::decode) }
+                      .associateBy { it.dramaId }
+
+              private fun encode(p: DramaProgress): String {
+                  val episodes = JSONArray()
+                  p.episodes.values.forEach { e ->
+                      episodes.put(
+                          JSONObject()
+                              .put("ep", e.episode)
+                              .put("pos", e.positionMs)
+                              .put("dur", e.durationMs)
+                              .put("at", e.updatedAt),
+                      )
+                  }
+                  return JSONObject()
+                      .put("id", p.dramaId)
+                      .put("last", p.lastEpisode)
+                      .put("at", p.updatedAt)
+                      .put("episodes", episodes)
+                      .toString()
+              }
+
+              private fun decode(raw: String): DramaProgress? = runCatching {
+                  val json = JSONObject(raw)
+                  val arr = json.getJSONArray("episodes")
+                  val episodes = (0 until arr.length()).associate { i ->
+                      val e = arr.getJSONObject(i)
+                      val ep = e.getInt("ep")
+                      ep to EpisodeProgress(ep, e.getLong("pos"), e.getLong("dur"), e.getLong("at"))
+                  }
+                  DramaProgress(json.getString("id"), json.getInt("last"), episodes, json.getLong("at"))
+              }.getOrNull()
+
+              private companion object {
+                  const val KEY_PREFIX = "p_"
+              }
+          }
+
+          class SearchHistoryRepository(context: Context) {
+
+              private val prefs = context.getSharedPreferences("search_history", Context.MODE_PRIVATE)
+              private val _items = MutableStateFlow(load())
+              val items: StateFlow<List<String>> = _items.asStateFlow()
+
+              fun add(query: String) {
+                  val q = query.trim()
+                  if (q.isEmpty()) return
+                  _items.update { (listOf(q) + it.filterNot { old -> old == q }).take(MAX) }
+                  persist()
+              }
+
+              fun clear() {
+                  _items.value = emptyList()
+                  persist()
+              }
+
+              private fun load(): List<String> = runCatching {
+                  val arr = JSONArray(prefs.getString(KEY, "[]"))
+                  (0 until arr.length()).map { arr.getString(it) }
+              }.getOrDefault(emptyList())
+
+              private fun persist() {
+                  prefs.edit().putString(KEY, JSONArray(_items.value).toString()).apply()
+              }
+
+              private companion object {
+                  const val KEY = "items"
+                  const val MAX = 12
+              }
+          }
+          __EOF__
+
+          f $S/ShiguangApp.kt <<'__EOF__'
+          package com.shiguang.video
+
+          import android.app.Activity
+          import android.app.Application
+          import android.content.Context
+          import android.content.ContextWrapper
+          import com.shiguang.video.data.SearchHistoryRepository
+          import com.shiguang.video.data.WatchProgressRepository
+
+          class ShiguangApp : Application() {
+              lateinit var progressRepo: WatchProgressRepository
+                  private set
+              lateinit var searchHistory: SearchHistoryRepository
+                  private set
+
+              override fun onCreate() {
+                  super.onCreate()
+                  progressRepo = WatchProgressRepository(this)
+                  searchHistory = SearchHistoryRepository(this)
+              }
+          }
+
+          val Context.app: ShiguangApp get() = applicationContext as ShiguangApp
+
+          fun Context.findActivity(): Activity? {
+              var c: Context = this
+              while (c is ContextWrapper) {
+                  if (c is Activity) return c
+                  c = c.baseContext
+              }
+              return null
+          }
+          __EOF__
+
+          f $S/MainActivity.kt <<'__EOF__'
+          package com.shiguang.video
+
+          import android.graphics.Color
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import com.shiguang.video.ui.AppNavHost
+          import com.shiguang.video.ui.theme.ShiguangTheme
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+                  )
+                  setContent {
+                      ShiguangTheme {
+                          AppNavHost()
+                      }
+                  }
+              }
+          }
+          __EOF__
+
+          f $S/ui/theme/Theme.kt <<'__EOF__'
+          package com.shiguang.video.ui.theme
+
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+
+          object AppColors {
+              val Background = Color(0xFF0B0B0F)
+              val Surface = Color(0xFF17171C)
+              val SurfaceHigh = Color(0xFF26262D)
+              val Accent = Color(0xFFE8505B)
+              val TextPrimary = Color(0xFFF2F2F5)
+              val TextSecondary = Color(0xFF8E8E99)
+              val Online = Color(0xFF2F9E5B)
+          }
+
+          private val DarkScheme = darkColorScheme(
+              primary = AppColors.Accent,
+              onPrimary = Color.White,
+              background = AppColors.Background,
+              onBackground = AppColors.TextPrimary,
+              surface = AppColors.Surface,
+              onSurface = AppColors.TextPrimary,
+              surfaceVariant = AppColors.SurfaceHigh,
+              onSurfaceVariant = AppColors.TextSecondary,
+          )
+
+          @Composable
+          fun ShiguangTheme(content: @Composable () -> Unit) {
+              MaterialTheme(colorScheme = DarkScheme, content = content)
+          }
+          __EOF__
+
+          f app/src/test/java/com/shiguang/video/data/ProgressPolicyTest.kt <<'__EOF__'
+          package com.shiguang.video.data
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertFalse
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class ProgressPolicyTest {
+
+              private fun ep(n: Int, pos: Long, dur: Long) = EpisodeProgress(n, pos, dur, updatedAt = 0)
+
+              @Test
+              fun finishedByFractionOrTail() {
+                  assertTrue(ProgressPolicy.isFinished(95_000, 100_000))
+                  assertTrue(ProgressPolicy.isFinished(93_000, 100_000)) // 不足 95%，但只剩 7 秒
+                  assertFalse(ProgressPolicy.isFinished(300_000, 600_000))
+                  assertFalse(ProgressPolicy.isFinished(10_000, 0)) // 时长未知
+              }
+
+              @Test
+              fun shortClipDoesNotUseTailRule() {
+                  // 20 秒的短片，播到第 13 秒不应算看完
+                  assertFalse(ProgressPolicy.isFinished(13_000, 20_000))
+              }
+
+              @Test
+              fun resumePosition() {
+                  assertEquals(0L, ProgressPolicy.resumePositionMs(null))
+                  assertEquals(0L, ProgressPolicy.resumePositionMs(ep(1, 1_500, 600_000))) // 太靠前
+                  assertEquals(0L, ProgressPolicy.resumePositionMs(ep(1, 599_000, 600_000))) // 已看完，从头
+                  assertEquals(125_000L, ProgressPolicy.resumePositionMs(ep(1, 125_000, 600_000)))
+              }
+
+              @Test
+              fun continueEpisodeMovesToNextWhenFinished() {
+                  val finished = DramaProgress("d", 3, mapOf(3 to ep(3, 600_000, 600_000)), 0)
+                  assertEquals(4, ProgressPolicy.episodeToContinue(finished, episodeCount = 10))
+                  // 最后一集看完则停留在最后一集
+                  assertEquals(3, ProgressPolicy.episodeToContinue(finished, episodeCount = 3))
+
+                  val halfway = DramaProgress("d", 3, mapOf(3 to ep(3, 200_000, 600_000)), 0)
+                  assertEquals(3, ProgressPolicy.episodeToContinue(halfway, episodeCount = 10))
+                  assertEquals(1, ProgressPolicy.episodeToContinue(null, episodeCount = 10))
+              }
+
+              @Test
+              fun formatsDuration() {
+                  assertEquals("00:00", formatDuration(0))
+                  assertEquals("03:21", formatDuration(201_000))
+                  assertEquals("1:02:03", formatDuration(3_723_000))
+              }
+          }
+          __EOF__
+
+      - name: Generate UI components and navigation
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/ui/components/Poster.kt <<'__EOF__'
+          package com.shiguang.video.ui.components
+
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.BoxWithConstraints
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.offset
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Shadow
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.ui.theme.AppColors
+
+          private val PosterPalettes = listOf(
+              listOf(Color(0xFF3A1C71), Color(0xFFD76D77), Color(0xFFFFAF7B)),
+              listOf(Color(0xFF0F2027), Color(0xFF203A43), Color(0xFF2C5364)),
+              listOf(Color(0xFF42275A), Color(0xFF734B6D)),
+              listOf(Color(0xFF134E5E), Color(0xFF71B280)),
+              listOf(Color(0xFF8E2DE2), Color(0xFF4A00E0)),
+              listOf(Color(0xFF7F1D1D), Color(0xFFB45309), Color(0xFFF59E0B)),
+              listOf(Color(0xFF1F1C2C), Color(0xFF928DAB)),
+              listOf(Color(0xFF16222A), Color(0xFF3A6073)),
+              listOf(Color(0xFF603813), Color(0xFFB29F94)),
+              listOf(Color(0xFF232526), Color(0xFF414345), Color(0xFF8E0E00)),
+          )
+
+          /**
+           * 程序生成的占位海报：渐变底色 + 几何纹理 + 片名水印。
+           * 后续接入真实素材时，把这里替换成网络图片加载即可。
+           */
+          @Composable
+          fun Poster(
+              drama: Drama,
+              modifier: Modifier = Modifier,
+              corner: Dp = 10.dp,
+              showTitle: Boolean = true,
+              badge: String? = null,
+              progress: Float? = null,
+          ) {
+              val colors = PosterPalettes[drama.posterSeed.mod(PosterPalettes.size)]
+              val variant = drama.posterSeed % 3
+              BoxWithConstraints(
+                  modifier
+                      .clip(RoundedCornerShape(corner))
+                      .background(Brush.linearGradient(colors)),
+              ) {
+                  val width = maxWidth.value
+                  Canvas(Modifier.matchParentSize()) {
+                      val r = size.minDimension
+                      when (variant) {
+                          0 -> {
+                              drawCircle(Color.White.copy(alpha = 0.12f), r * 0.55f, Offset(size.width * 0.85f, size.height * 0.18f))
+                              drawCircle(Color.White.copy(alpha = 0.06f), r * 0.85f, Offset(size.width * 0.05f, size.height * 0.7f))
+                          }
+                          1 -> {
+                              drawCircle(Color.White.copy(alpha = 0.10f), r * 0.35f, Offset(size.width * 0.5f, size.height * 0.32f))
+                              drawCircle(Color.White.copy(alpha = 0.05f), r * 0.6f, Offset(size.width * 0.5f, size.height * 0.32f))
+                          }
+                          else -> {
+                              for (i in 0..5) {
+                                  val y = size.height * (0.1f + i * 0.09f)
+                                  drawLine(Color.White.copy(alpha = 0.07f), Offset(0f, y + size.width * 0.3f), Offset(size.width, y), strokeWidth = r * 0.03f)
+                              }
+                          }
+                      }
+                      drawRect(
+                          Brush.verticalGradient(
+                              listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f)),
+                              startY = size.height * 0.45f,
+                              endY = size.height,
+                          ),
+                      )
+                  }
+
+                  Text(
+                      text = drama.title.take(1),
+                      modifier = Modifier.align(Alignment.Center).offset(y = (-maxHeight.value * 0.1f).dp),
+                      color = Color.White.copy(alpha = 0.16f),
+                      fontSize = (width * 0.62f).sp,
+                      fontWeight = FontWeight.Black,
+                  )
+
+                  if (showTitle) {
+                      Text(
+                          text = drama.title,
+                          modifier = Modifier
+                              .align(Alignment.BottomCenter)
+                              .fillMaxWidth()
+                              .padding(horizontal = 8.dp, vertical = (width * 0.08f).dp),
+                          color = Color.White,
+                          fontSize = (width * 0.12f).coerceIn(11f, 28f).sp,
+                          lineHeight = (width * 0.15f).coerceIn(14f, 34f).sp,
+                          fontWeight = FontWeight.ExtraBold,
+                          textAlign = TextAlign.Center,
+                          maxLines = 2,
+                          overflow = TextOverflow.Ellipsis,
+                          style = TextStyle(shadow = Shadow(Color.Black.copy(alpha = 0.6f), Offset(0f, 2f), 6f)),
+                      )
+                  }
+
+                  if (badge != null) {
+                      Text(
+                          text = badge,
+                          modifier = Modifier
+                              .align(Alignment.TopStart)
+                              .padding(6.dp)
+                              .clip(RoundedCornerShape(50))
+                              .background(AppColors.Online)
+                              .padding(horizontal = 8.dp, vertical = 2.dp),
+                          color = Color.White,
+                          fontSize = 11.sp,
+                          fontWeight = FontWeight.Bold,
+                      )
+                  }
+
+                  Text(
+                      text = drama.type.label,
+                      modifier = Modifier
+                          .align(Alignment.TopEnd)
+                          .padding(6.dp)
+                          .clip(RoundedCornerShape(4.dp))
+                          .background(Color.Black.copy(alpha = 0.35f))
+                          .padding(horizontal = 5.dp, vertical = 1.dp),
+                      color = Color.White.copy(alpha = 0.85f),
+                      fontSize = 10.sp,
+                  )
+
+                  if (progress != null) {
+                      ProgressStrip(progress, Modifier.align(Alignment.BottomCenter).fillMaxWidth())
+                  }
+              }
+          }
+          __EOF__
+
+          f $S/ui/components/Components.kt <<'__EOF__'
+          package com.shiguang.video.ui.components
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.WindowInsets
+          import androidx.compose.foundation.layout.asPaddingValues
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxHeight
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.navigationBars
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.Dp
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.ui.theme.AppColors
+
+          /** 悬浮底栏占用的高度，列表底部需要留出这段空间 */
+          val BottomBarSpace = 96.dp
+
+          @Composable
+          fun bottomContentPadding(): Dp =
+              BottomBarSpace + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+
+          @Composable
+          fun Pill(
+              text: String,
+              selected: Boolean,
+              onClick: () -> Unit,
+              modifier: Modifier = Modifier,
+              large: Boolean = false,
+          ) {
+              Box(
+                  modifier
+                      .clip(RoundedCornerShape(50))
+                      .background(if (selected) AppColors.Accent else AppColors.SurfaceHigh)
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = if (large) 22.dp else 14.dp, vertical = if (large) 9.dp else 6.dp),
+                  contentAlignment = Alignment.Center,
+              ) {
+                  Text(
+                      text = text,
+                      color = if (selected) Color.White else AppColors.TextSecondary,
+                      fontSize = if (large) 16.sp else 13.sp,
+                      fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                  )
+              }
+          }
+
+          @Composable
+          fun SectionHeader(
+              title: String,
+              modifier: Modifier = Modifier,
+              extra: String? = null,
+              action: String? = null,
+              onAction: (() -> Unit)? = null,
+          ) {
+              Row(
+                  modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 20.dp),
+                  verticalAlignment = Alignment.Bottom,
+              ) {
+                  Text(title, fontSize = 21.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
+                  if (extra != null) {
+                      Spacer(Modifier.width(10.dp))
+                      Text(extra, fontSize = 13.sp, color = AppColors.TextSecondary, modifier = Modifier.padding(bottom = 3.dp))
+                  }
+                  Spacer(Modifier.weight(1f))
+                  if (action != null && onAction != null) {
+                      Text(
+                          text = "$action ›",
+                          fontSize = 13.sp,
+                          color = AppColors.TextSecondary,
+                          modifier = Modifier
+                              .clickable(onClick = onAction)
+                              .padding(bottom = 3.dp),
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun DramaCard(
+              drama: Drama,
+              subtitle: String,
+              onClick: () -> Unit,
+              modifier: Modifier = Modifier,
+              badge: String? = null,
+              progress: Float? = null,
+              posterRatio: Float = 0.72f,
+          ) {
+              Column(
+                  modifier
+                      .clip(RoundedCornerShape(10.dp))
+                      .clickable(onClick = onClick),
+              ) {
+                  Poster(
+                      drama = drama,
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .aspectRatio(posterRatio),
+                      badge = badge,
+                      progress = progress,
+                  )
+                  Spacer(Modifier.height(6.dp))
+                  Text(
+                      text = drama.title,
+                      color = AppColors.TextPrimary,
+                      fontSize = 15.sp,
+                      fontWeight = FontWeight.SemiBold,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                  )
+                  Spacer(Modifier.height(2.dp))
+                  Text(
+                      text = subtitle,
+                      color = AppColors.TextSecondary,
+                      fontSize = 12.sp,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                  )
+              }
+          }
+
+          @Composable
+          fun ProgressStrip(fraction: Float, modifier: Modifier = Modifier, height: Dp = 3.dp) {
+              Box(
+                  modifier
+                      .height(height)
+                      .background(Color.White.copy(alpha = 0.22f)),
+              ) {
+                  Box(
+                      Modifier
+                          .fillMaxHeight()
+                          .fillMaxWidth(fraction.coerceIn(0f, 1f))
+                          .background(AppColors.Accent),
+                  )
+              }
+          }
+
+          @Composable
+          fun RoundIconButton(
+              icon: ImageVector,
+              contentDescription: String,
+              onClick: () -> Unit,
+              modifier: Modifier = Modifier,
+              size: Dp = 44.dp,
+              background: Color = AppColors.SurfaceHigh,
+          ) {
+              Box(
+                  modifier
+                      .size(size)
+                      .clip(CircleShape)
+                      .background(background)
+                      .clickable(onClick = onClick),
+                  contentAlignment = Alignment.Center,
+              ) {
+                  Icon(icon, contentDescription, tint = AppColors.TextPrimary, modifier = Modifier.size(size * 0.5f))
+              }
+          }
+
+          @Composable
+          fun EmptyState(text: String, modifier: Modifier = Modifier) {
+              Column(
+                  modifier
+                      .fillMaxSize()
+                      .padding(40.dp),
+                  verticalArrangement = Arrangement.Center,
+                  horizontalAlignment = Alignment.CenterHorizontally,
+              ) {
+                  Text(text, color = AppColors.TextSecondary, fontSize = 14.sp, textAlign = TextAlign.Center)
+              }
+          }
+          __EOF__
+
+          f $S/ui/components/History.kt <<'__EOF__'
+          package com.shiguang.video.ui.components
+
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.remember
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import com.shiguang.video.app
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.DramaProgress
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.ProgressPolicy
+          import com.shiguang.video.data.WatchProgressRepository
+
+          data class HistoryItem(val drama: Drama, val progress: DramaProgress) {
+              /** 点击“继续观看”时进入的集数 */
+              val continueEpisode: Int get() = ProgressPolicy.episodeToContinue(progress, drama.episodeCount)
+
+              val label: String
+                  get() = when {
+                      drama.type == ContentType.MOVIE -> if (progress.last?.finished == true) "已看完" else "已看 ${percent()}%"
+                      else -> "看到第${progress.lastEpisode}集"
+                  }
+
+              val fraction: Float get() = progress.last?.fraction ?: 0f
+
+              private fun percent() = (fraction * 100).toInt()
+          }
+
+          @Composable
+          fun rememberProgressRepo(): WatchProgressRepository {
+              val context = LocalContext.current
+              return remember(context) { context.app.progressRepo }
+          }
+
+          /** 按最近观看时间倒序的观看记录 */
+          @Composable
+          fun rememberWatchHistory(): List<HistoryItem> {
+              val repo = rememberProgressRepo()
+              val all by repo.all.collectAsStateWithLifecycle()
+              return remember(all) {
+                  all.values
+                      .sortedByDescending { it.updatedAt }
+                      .mapNotNull { p -> MockCatalog.find(p.dramaId)?.let { HistoryItem(it, p) } }
+              }
+          }
+          __EOF__
+
+          f $S/ui/AppNav.kt <<'__EOF__'
+          package com.shiguang.video.ui
+
+          import androidx.compose.runtime.Composable
+          import androidx.navigation.NavType
+          import androidx.navigation.compose.NavHost
+          import androidx.navigation.compose.composable
+          import androidx.navigation.compose.rememberNavController
+          import androidx.navigation.navArgument
+          import com.shiguang.video.ui.detail.DetailScreen
+          import com.shiguang.video.ui.main.MainScreen
+          import com.shiguang.video.ui.player.PlayerScreen
+
+          private object Routes {
+              const val MAIN = "main"
+              const val DETAIL = "detail/{id}"
+              const val PLAYER = "player/{id}/{ep}"
+
+              fun detail(id: String) = "detail/$id"
+              fun player(id: String, episode: Int) = "player/$id/$episode"
+          }
+
+          @Composable
+          fun AppNavHost() {
+              val nav = rememberNavController()
+
+              NavHost(navController = nav, startDestination = Routes.MAIN) {
+                  composable(Routes.MAIN) {
+                      MainScreen(
+                          onOpenDrama = { id -> nav.navigate(Routes.detail(id)) },
+                          onPlay = { id, ep -> nav.navigate(Routes.player(id, ep)) { launchSingleTop = true } },
+                      )
+                  }
+                  composable(
+                      Routes.DETAIL,
+                      arguments = listOf(navArgument("id") { type = NavType.StringType }),
+                  ) { entry ->
+                      val id = entry.arguments?.getString("id").orEmpty()
+                      DetailScreen(
+                          dramaId = id,
+                          onBack = { nav.popBackStack() },
+                          onPlay = { ep -> nav.navigate(Routes.player(id, ep)) { launchSingleTop = true } },
+                          onOpenDrama = { other -> nav.navigate(Routes.detail(other)) },
+                      )
+                  }
+                  composable(
+                      Routes.PLAYER,
+                      arguments = listOf(
+                          navArgument("id") { type = NavType.StringType },
+                          navArgument("ep") { type = NavType.IntType },
+                      ),
+                  ) { entry ->
+                      PlayerScreen(
+                          dramaId = entry.arguments?.getString("id").orEmpty(),
+                          startEpisode = entry.arguments?.getInt("ep") ?: 1,
+                          onBack = { nav.popBackStack() },
+                      )
+                  }
+              }
+          }
+          __EOF__
+
+      - name: Generate main, home and category screens
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/ui/main/MainScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.main
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxHeight
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.navigationBarsPadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.List
+          import androidx.compose.material.icons.filled.Home
+          import androidx.compose.material.icons.filled.Menu
+          import androidx.compose.material.icons.filled.Person
+          import androidx.compose.material.icons.filled.Search
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.listSaver
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.ui.category.CategoryFilter
+          import com.shiguang.video.ui.category.CategoryScreen
+          import com.shiguang.video.ui.category.SortOrder
+          import com.shiguang.video.ui.home.HomeScreen
+          import com.shiguang.video.ui.mine.MineScreen
+          import com.shiguang.video.ui.rank.RankScreen
+          import com.shiguang.video.ui.search.SearchScreen
+          import com.shiguang.video.ui.theme.AppColors
+
+          enum class MainTab(val label: String, val icon: ImageVector) {
+              HOME("首页", Icons.Filled.Home),
+              CATEGORY("分类", Icons.Filled.Menu),
+              RANK("榜单", Icons.AutoMirrored.Filled.List),
+              SEARCH("搜索", Icons.Filled.Search),
+              MINE("我的", Icons.Filled.Person),
+          }
+
+          private val CategoryFilterSaver = listSaver<CategoryFilter, String>(
+              save = { listOf(it.type?.name.orEmpty(), it.genre.orEmpty(), it.sort.name) },
+              restore = {
+                  CategoryFilter(
+                      type = it[0].takeIf(String::isNotEmpty)?.let(ContentType::valueOf),
+                      genre = it[1].takeIf(String::isNotEmpty),
+                      sort = SortOrder.valueOf(it[2]),
+                  )
+              },
+          )
+
+          @Composable
+          fun MainScreen(
+              onOpenDrama: (String) -> Unit,
+              onPlay: (String, Int) -> Unit,
+          ) {
+              var tab by rememberSaveable { mutableStateOf(MainTab.HOME) }
+              var categoryFilter by rememberSaveable(stateSaver = CategoryFilterSaver) {
+                  mutableStateOf(CategoryFilter())
+              }
+              // 每个 Tab 各自保存滚动位置、输入内容等状态
+              val stateHolder = rememberSaveableStateHolder()
+
+              Box(
+                  Modifier
+                      .fillMaxSize()
+                      .background(AppColors.Background),
+              ) {
+                  stateHolder.SaveableStateProvider(tab.name) {
+                      when (tab) {
+                          MainTab.HOME -> HomeScreen(
+                              onOpenDrama = onOpenDrama,
+                              onPlay = onPlay,
+                              onSearch = { tab = MainTab.SEARCH },
+                              onSeeAllRecent = { type ->
+                                  categoryFilter = CategoryFilter(type = type, sort = SortOrder.NEWEST)
+                                  tab = MainTab.CATEGORY
+                              },
+                          )
+                          MainTab.CATEGORY -> CategoryScreen(
+                              filter = categoryFilter,
+                              onFilterChange = { categoryFilter = it },
+                              onOpenDrama = onOpenDrama,
+                          )
+                          MainTab.RANK -> RankScreen(onOpenDrama = onOpenDrama)
+                          MainTab.SEARCH -> SearchScreen(onOpenDrama = onOpenDrama)
+                          MainTab.MINE -> MineScreen(onOpenDrama = onOpenDrama, onPlay = onPlay)
+                      }
+                  }
+
+                  FloatingTabBar(
+                      selected = tab,
+                      onSelect = { tab = it },
+                      modifier = Modifier.align(Alignment.BottomCenter),
+                  )
+              }
+          }
+
+          @Composable
+          private fun FloatingTabBar(
+              selected: MainTab,
+              onSelect: (MainTab) -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              val shape = RoundedCornerShape(34.dp)
+              Row(
+                  modifier
+                      .navigationBarsPadding()
+                      .padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+                      .fillMaxWidth()
+                      .height(68.dp)
+                      .clip(shape)
+                      .background(Color(0xF02A2A31))
+                      .border(1.dp, Color.White.copy(alpha = 0.08f), shape)
+                      .padding(6.dp),
+                  horizontalArrangement = Arrangement.spacedBy(2.dp),
+              ) {
+                  MainTab.entries.forEach { item ->
+                      val isSelected = item == selected
+                      val tint = if (isSelected) AppColors.Accent else AppColors.TextPrimary.copy(alpha = 0.85f)
+                      Column(
+                          Modifier
+                              .weight(1f)
+                              .fillMaxHeight()
+                              .clip(RoundedCornerShape(28.dp))
+                              .background(if (isSelected) Color(0xFF3A3A43) else Color.Transparent)
+                              .clickable { onSelect(item) },
+                          horizontalAlignment = Alignment.CenterHorizontally,
+                          verticalArrangement = Arrangement.Center,
+                      ) {
+                          Icon(item.icon, contentDescription = item.label, tint = tint, modifier = Modifier.size(24.dp))
+                          Spacer(Modifier.height(2.dp))
+                          Text(
+                              text = item.label,
+                              color = tint,
+                              fontSize = 11.sp,
+                              fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                          )
+                      }
+                  }
+              }
+          }
+          __EOF__
+
+          f $S/ui/home/HomeScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.home
+
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Search
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.ui.components.DramaCard
+          import com.shiguang.video.ui.components.Pill
+          import com.shiguang.video.ui.components.RoundIconButton
+          import com.shiguang.video.ui.components.SectionHeader
+          import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberWatchHistory
+          import com.shiguang.video.ui.theme.AppColors
+
+          private val RowCardWidth = 116.dp
+
+          @Composable
+          fun HomeScreen(
+              onOpenDrama: (String) -> Unit,
+              onPlay: (String, Int) -> Unit,
+              onSearch: () -> Unit,
+              onSeeAllRecent: (ContentType?) -> Unit,
+          ) {
+              // null 表示“推荐”，即不按类型过滤
+              var type by rememberSaveable { mutableStateOf<ContentType?>(null) }
+              val history = rememberWatchHistory().filter { type == null || it.drama.type == type }
+
+              val source = remember(type) { MockCatalog.dramas.filter { type == null || it.type == type } }
+              val recent = remember(source) { source.sortedBy { it.updatedDaysAgo }.take(10) }
+              val recommended = remember(source) {
+                  // 模拟“每日更新”的推荐顺序：评分为主，按日期轻微打散
+                  val day = (System.currentTimeMillis() / 86_400_000L).toInt()
+                  source.sortedByDescending { it.score * 10 + (it.posterSeed + day) % 5 }
+              }
+
+              LazyColumn(
+                  modifier = Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(bottom = bottomContentPadding()),
+                  verticalArrangement = Arrangement.spacedBy(14.dp),
+              ) {
+                  item {
+                      Row(
+                          Modifier
+                              .statusBarsPadding()
+                              .padding(start = 20.dp, end = 20.dp, top = 16.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Column(Modifier.weight(1f)) {
+                              Text("拾光影视", fontSize = 30.sp, fontWeight = FontWeight.Black, color = AppColors.TextPrimary)
+                              Text("精选好剧 · 随时续看", fontSize = 14.sp, color = AppColors.TextSecondary)
+                          }
+                          RoundIconButton(Icons.Filled.Search, "搜索", onClick = onSearch, size = 48.dp)
+                      }
+                  }
+
+                  item {
+                      LazyRow(
+                          contentPadding = PaddingValues(horizontal = 20.dp),
+                          horizontalArrangement = Arrangement.spacedBy(12.dp),
+                      ) {
+                          item { Pill("推荐", type == null, { type = null }, large = true) }
+                          items(ContentType.entries) { t ->
+                              Pill(t.label, type == t, { type = t }, large = true)
+                          }
+                      }
+                  }
+
+                  if (history.isNotEmpty()) {
+                      item { SectionHeader("继续观看", Modifier.padding(top = 6.dp)) }
+                      item {
+                          LazyRow(
+                              contentPadding = PaddingValues(horizontal = 20.dp),
+                              horizontalArrangement = Arrangement.spacedBy(12.dp),
+                          ) {
+                              items(history, key = { it.drama.id }) { h ->
+                                  DramaCard(
+                                      drama = h.drama,
+                                      subtitle = h.label,
+                                      progress = h.fraction,
+                                      onClick = { onPlay(h.drama.id, h.continueEpisode) },
+                                      modifier = Modifier.width(RowCardWidth),
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  item {
+                      SectionHeader(
+                          title = "最近更新",
+                          extra = "共 ${source.size} 部",
+                          action = "查看全部",
+                          onAction = { onSeeAllRecent(type) },
+                          modifier = Modifier.padding(top = 6.dp),
+                      )
+                  }
+                  item {
+                      LazyRow(
+                          contentPadding = PaddingValues(horizontal = 20.dp),
+                          horizontalArrangement = Arrangement.spacedBy(12.dp),
+                      ) {
+                          items(recent, key = { it.id }) { d ->
+                              DramaCard(
+                                  drama = d,
+                                  subtitle = d.heatText,
+                                  badge = if (d.updatedDaysAgo <= 1) "新上线" else null,
+                                  onClick = { onOpenDrama(d.id) },
+                                  modifier = Modifier.width(RowCardWidth),
+                              )
+                          }
+                      }
+                  }
+
+                  item { SectionHeader("为你推荐", extra = "每日更新", modifier = Modifier.padding(top = 6.dp)) }
+                  items(recommended.chunked(2)) { pair ->
+                      RecommendRow(pair, onOpenDrama)
+                  }
+              }
+          }
+
+          @Composable
+          private fun RecommendRow(pair: List<Drama>, onOpenDrama: (String) -> Unit) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 20.dp),
+                  horizontalArrangement = Arrangement.spacedBy(12.dp),
+              ) {
+                  pair.forEach { d ->
+                      DramaCard(
+                          drama = d,
+                          subtitle = "${d.genres.joinToString(" · ")} · ${d.episodeText}",
+                          onClick = { onOpenDrama(d.id) },
+                          posterRatio = 0.78f,
+                          modifier = Modifier.weight(1f),
+                      )
+                  }
+                  if (pair.size == 1) Spacer(Modifier.weight(1f))
+              }
+              Spacer(Modifier.height(4.dp))
+          }
+          __EOF__
+
+          f $S/ui/category/CategoryScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.category
+
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.GridItemSpan
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.remember
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.ui.components.DramaCard
+          import com.shiguang.video.ui.components.EmptyState
+          import com.shiguang.video.ui.components.Pill
+          import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.theme.AppColors
+
+          enum class SortOrder(val label: String) {
+              HOT("最热"),
+              NEWEST("最新"),
+              SCORE("好评"),
+          }
+
+          data class CategoryFilter(
+              val type: ContentType? = null,
+              val genre: String? = null,
+              val sort: SortOrder = SortOrder.HOT,
+          )
+
+          fun applyFilter(dramas: List<Drama>, filter: CategoryFilter): List<Drama> {
+              val filtered = dramas.filter { d ->
+                  (filter.type == null || d.type == filter.type) &&
+                      (filter.genre == null || filter.genre in d.genres)
+              }
+              return when (filter.sort) {
+                  SortOrder.HOT -> filtered.sortedByDescending { it.heat }
+                  SortOrder.NEWEST -> filtered.sortedBy { it.updatedDaysAgo }
+                  SortOrder.SCORE -> filtered.sortedByDescending { it.score }
+              }
+          }
+
+          @Composable
+          fun CategoryScreen(
+              filter: CategoryFilter,
+              onFilterChange: (CategoryFilter) -> Unit,
+              onOpenDrama: (String) -> Unit,
+          ) {
+              val results = remember(filter) { applyFilter(MockCatalog.dramas, filter) }
+
+              LazyVerticalGrid(
+                  columns = GridCells.Fixed(3),
+                  modifier = Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = bottomContentPadding()),
+                  horizontalArrangement = Arrangement.spacedBy(12.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp),
+              ) {
+                  item(span = { GridItemSpan(maxLineSpan) }) {
+                      Column(
+                          Modifier
+                              .statusBarsPadding()
+                              .padding(top = 16.dp),
+                          verticalArrangement = Arrangement.spacedBy(12.dp),
+                      ) {
+                          Text("分类筛选", fontSize = 26.sp, fontWeight = FontWeight.Black, color = AppColors.TextPrimary)
+                          FilterRow(
+                              label = "类型",
+                              options = listOf<ContentType?>(null) + ContentType.entries,
+                              selected = filter.type,
+                              text = { it?.label ?: "全部" },
+                              onSelect = { onFilterChange(filter.copy(type = it)) },
+                          )
+                          FilterRow(
+                              label = "题材",
+                              options = listOf<String?>(null) + MockCatalog.genres,
+                              selected = filter.genre,
+                              text = { it ?: "全部" },
+                              onSelect = { onFilterChange(filter.copy(genre = it)) },
+                          )
+                          FilterRow(
+                              label = "排序",
+                              options = SortOrder.entries,
+                              selected = filter.sort,
+                              text = { it.label },
+                              onSelect = { onFilterChange(filter.copy(sort = it)) },
+                          )
+                          Text("共 ${results.size} 部", fontSize = 13.sp, color = AppColors.TextSecondary)
+                      }
+                  }
+
+                  if (results.isEmpty()) {
+                      item(span = { GridItemSpan(maxLineSpan) }) {
+                          EmptyState("没有符合条件的内容，换个筛选试试")
+                      }
+                  }
+
+                  items(results, key = { it.id }) { d ->
+                      DramaCard(
+                          drama = d,
+                          subtitle = if (filter.sort == SortOrder.SCORE) "${d.score}分 · ${d.episodeText}" else d.heatText,
+                          onClick = { onOpenDrama(d.id) },
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun <T> FilterRow(
+              label: String,
+              options: List<T>,
+              selected: T,
+              text: (T) -> String,
+              onSelect: (T) -> Unit,
+          ) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Text(label, fontSize = 13.sp, color = AppColors.TextSecondary, modifier = Modifier.width(40.dp))
+                  LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(end = 8.dp)) {
+                      items(options) { option ->
+                          Pill(text(option), option == selected, { onSelect(option) })
+                      }
+                  }
+              }
+          }
+          __EOF__
+
+      - name: Generate rank and search screens
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/ui/rank/RankScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.rank
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.ui.components.Pill
+          import com.shiguang.video.ui.components.Poster
+          import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.theme.AppColors
+
+          private enum class RankKind(val label: String) {
+              HOT("热播榜"),
+              SCORE("好评榜"),
+              NEW("新剧榜"),
+          }
+
+          @Composable
+          fun RankScreen(onOpenDrama: (String) -> Unit) {
+              var kind by rememberSaveable { mutableStateOf(RankKind.HOT) }
+              val list = remember(kind) {
+                  when (kind) {
+                      RankKind.HOT -> MockCatalog.dramas.sortedByDescending { it.heat }
+                      RankKind.SCORE -> MockCatalog.dramas.sortedByDescending { it.score }
+                      RankKind.NEW -> MockCatalog.dramas.sortedWith(compareBy<Drama> { it.updatedDaysAgo }.thenByDescending { it.heat })
+                  }.take(15)
+              }
+
+              LazyColumn(
+                  modifier = Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = bottomContentPadding()),
+                  verticalArrangement = Arrangement.spacedBy(14.dp),
+              ) {
+                  item {
+                      Column(Modifier.statusBarsPadding().padding(top = 16.dp)) {
+                          Text("榜单", fontSize = 26.sp, fontWeight = FontWeight.Black, color = AppColors.TextPrimary)
+                          Spacer(Modifier.height(12.dp))
+                          Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                              RankKind.entries.forEach { k -> Pill(k.label, k == kind, { kind = k }) }
+                          }
+                      }
+                  }
+                  itemsIndexed(list, key = { _, d -> d.id }) { index, d ->
+                      RankRow(index + 1, d, kind, onClick = { onOpenDrama(d.id) })
+                  }
+              }
+          }
+
+          @Composable
+          private fun RankRow(rank: Int, drama: Drama, kind: RankKind, onClick: () -> Unit) {
+              val rankColor = when (rank) {
+                  1 -> Color(0xFFFFC53D)
+                  2 -> Color(0xFFD9D9E0)
+                  3 -> Color(0xFFE0915A)
+                  else -> AppColors.TextSecondary
+              }
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(12.dp))
+                      .background(AppColors.Surface)
+                      .clickable(onClick = onClick)
+                      .padding(10.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Text(
+                      text = rank.toString(),
+                      color = rankColor,
+                      fontSize = 22.sp,
+                      fontWeight = FontWeight.Black,
+                      fontStyle = FontStyle.Italic,
+                      modifier = Modifier.width(34.dp),
+                  )
+                  Poster(drama, Modifier.size(width = 64.dp, height = 88.dp), corner = 8.dp, showTitle = false)
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(drama.title, color = AppColors.TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          "${drama.type.label} · ${drama.genres.joinToString(" · ")} · ${drama.episodeText}",
+                          color = AppColors.TextSecondary,
+                          fontSize = 12.sp,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                      )
+                      Spacer(Modifier.height(6.dp))
+                      Text(
+                          text = when (kind) {
+                              RankKind.SCORE -> "${drama.score} 分"
+                              RankKind.NEW -> if (drama.updatedDaysAgo == 0) "今日更新" else "${drama.updatedDaysAgo} 天前更新"
+                              RankKind.HOT -> drama.heatText
+                          },
+                          color = AppColors.Accent,
+                          fontSize = 13.sp,
+                          fontWeight = FontWeight.Medium,
+                      )
+                  }
+              }
+          }
+          __EOF__
+
+          f $S/ui/search/SearchScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.search
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.ExperimentalLayoutApi
+          import androidx.compose.foundation.layout.FlowRow
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.BasicTextField
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Clear
+          import androidx.compose.material.icons.filled.Delete
+          import androidx.compose.material.icons.filled.Search
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.SolidColor
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import com.shiguang.video.app
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.ui.components.EmptyState
+          import com.shiguang.video.ui.components.Poster
+          import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.theme.AppColors
+
+          @Composable
+          fun SearchScreen(onOpenDrama: (String) -> Unit) {
+              val context = LocalContext.current
+              val historyRepo = remember(context) { context.app.searchHistory }
+              val history by historyRepo.items.collectAsStateWithLifecycle()
+              val keyboard = LocalSoftwareKeyboardController.current
+
+              var query by rememberSaveable { mutableStateOf("") }
+              val results = remember(query) { MockCatalog.search(query) }
+
+              val submit: (String) -> Unit = { q ->
+                  query = q
+                  historyRepo.add(q)
+                  keyboard?.hide()
+              }
+
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .statusBarsPadding(),
+              ) {
+                  SearchField(
+                      value = query,
+                      onValueChange = { query = it },
+                      onSubmit = { submit(query) },
+                      modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 8.dp),
+                  )
+
+                  when {
+                      query.isBlank() -> SearchSuggestions(
+                          history = history,
+                          onPick = submit,
+                          onClearHistory = historyRepo::clear,
+                      )
+                      results.isEmpty() -> EmptyState("没有找到“$query”相关内容")
+                      else -> LazyColumn(
+                          contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = bottomContentPadding()),
+                          verticalArrangement = Arrangement.spacedBy(14.dp),
+                      ) {
+                          item {
+                              Text("找到 ${results.size} 个结果", fontSize = 13.sp, color = AppColors.TextSecondary)
+                          }
+                          items(results, key = { it.id }) { d ->
+                              SearchResultRow(d, query) {
+                                  historyRepo.add(query)
+                                  onOpenDrama(d.id)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun SearchField(
+              value: String,
+              onValueChange: (String) -> Unit,
+              onSubmit: () -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              BasicTextField(
+                  value = value,
+                  onValueChange = onValueChange,
+                  singleLine = true,
+                  textStyle = TextStyle(color = AppColors.TextPrimary, fontSize = 16.sp),
+                  cursorBrush = SolidColor(AppColors.Accent),
+                  keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                  keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
+                  modifier = modifier.fillMaxWidth(),
+                  decorationBox = { inner ->
+                      Row(
+                          Modifier
+                              .clip(RoundedCornerShape(50))
+                              .background(AppColors.SurfaceHigh)
+                              .padding(horizontal = 16.dp, vertical = 12.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Icon(Icons.Filled.Search, null, tint = AppColors.TextSecondary, modifier = Modifier.size(20.dp))
+                          Spacer(Modifier.width(10.dp))
+                          Box(Modifier.weight(1f)) {
+                              if (value.isEmpty()) {
+                                  Text("搜索片名、题材", color = AppColors.TextSecondary, fontSize = 16.sp)
+                              }
+                              inner()
+                          }
+                          if (value.isNotEmpty()) {
+                              Icon(
+                                  Icons.Filled.Clear,
+                                  contentDescription = "清空",
+                                  tint = AppColors.TextSecondary,
+                                  modifier = Modifier
+                                      .size(20.dp)
+                                      .clickable { onValueChange("") },
+                              )
+                          }
+                      }
+                  },
+              )
+          }
+
+          @OptIn(ExperimentalLayoutApi::class)
+          @Composable
+          private fun SearchSuggestions(
+              history: List<String>,
+              onPick: (String) -> Unit,
+              onClearHistory: () -> Unit,
+          ) {
+              LazyColumn(
+                  contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = bottomContentPadding()),
+                  verticalArrangement = Arrangement.spacedBy(12.dp),
+              ) {
+                  if (history.isNotEmpty()) {
+                      item {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text("搜索历史", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
+                              Spacer(Modifier.weight(1f))
+                              Icon(
+                                  Icons.Filled.Delete,
+                                  contentDescription = "清空搜索历史",
+                                  tint = AppColors.TextSecondary,
+                                  modifier = Modifier
+                                      .size(20.dp)
+                                      .clickable(onClick = onClearHistory),
+                              )
+                          }
+                      }
+                      item {
+                          FlowRow(
+                              horizontalArrangement = Arrangement.spacedBy(8.dp),
+                              verticalArrangement = Arrangement.spacedBy(8.dp),
+                          ) {
+                              history.forEach { h ->
+                                  Text(
+                                      text = h,
+                                      color = AppColors.TextPrimary,
+                                      fontSize = 13.sp,
+                                      modifier = Modifier
+                                          .clip(RoundedCornerShape(50))
+                                          .background(AppColors.SurfaceHigh)
+                                          .clickable { onPick(h) }
+                                          .padding(horizontal = 14.dp, vertical = 6.dp),
+                                  )
+                              }
+                          }
+                      }
+                      item { Spacer(Modifier.height(8.dp)) }
+                  }
+
+                  item { Text("热门搜索", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary) }
+                  itemsIndexed(MockCatalog.hotKeywords) { index, keyword ->
+                      Row(
+                          Modifier
+                              .fillMaxWidth()
+                              .clickable { onPick(keyword) }
+                              .padding(vertical = 4.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Text(
+                              text = "${index + 1}",
+                              color = if (index < 3) AppColors.Accent else AppColors.TextSecondary,
+                              fontWeight = FontWeight.Bold,
+                              fontSize = 15.sp,
+                              modifier = Modifier.width(28.dp),
+                          )
+                          Text(keyword, color = AppColors.TextPrimary, fontSize = 15.sp)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun SearchResultRow(drama: Drama, query: String, onClick: () -> Unit) {
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(10.dp))
+                      .clickable(onClick = onClick),
+              ) {
+                  Poster(drama, Modifier.size(width = 84.dp, height = 116.dp), corner = 8.dp, showTitle = false)
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(
+                          text = drama.title,
+                          color = if (drama.title.contains(query.trim(), ignoreCase = true)) AppColors.Accent else AppColors.TextPrimary,
+                          fontSize = 16.sp,
+                          fontWeight = FontWeight.SemiBold,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                      )
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          "${drama.type.label} · ${drama.year} · ${drama.genres.joinToString(" · ")} · ${drama.episodeText}",
+                          color = AppColors.TextSecondary,
+                          fontSize = 12.sp,
+                      )
+                      Spacer(Modifier.height(6.dp))
+                      Text(drama.intro, color = Color(0xFFB4B4BE), fontSize = 13.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                  }
+              }
+          }
+          __EOF__
+
+      - name: Generate mine and detail screens
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/ui/mine/MineScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.mine
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.Person
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.data.TestVideos
+          import com.shiguang.video.data.formatDuration
+          import com.shiguang.video.ui.components.HistoryItem
+          import com.shiguang.video.ui.components.Poster
+          import com.shiguang.video.ui.components.ProgressStrip
+          import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberProgressRepo
+          import com.shiguang.video.ui.components.rememberWatchHistory
+          import com.shiguang.video.ui.theme.AppColors
+
+          @Composable
+          fun MineScreen(
+              onOpenDrama: (String) -> Unit,
+              onPlay: (String, Int) -> Unit,
+          ) {
+              val repo = rememberProgressRepo()
+              val history = rememberWatchHistory()
+              var confirmClear by rememberSaveable { mutableStateOf(false) }
+
+              LazyColumn(
+                  modifier = Modifier.fillMaxSize(),
+                  contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = bottomContentPadding()),
+                  verticalArrangement = Arrangement.spacedBy(12.dp),
+              ) {
+                  item {
+                      Row(
+                          Modifier
+                              .statusBarsPadding()
+                              .padding(top = 20.dp, bottom = 8.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Box(
+                              Modifier
+                                  .size(60.dp)
+                                  .clip(CircleShape)
+                                  .background(AppColors.SurfaceHigh),
+                              contentAlignment = Alignment.Center,
+                          ) {
+                              Icon(Icons.Filled.Person, null, tint = AppColors.TextSecondary, modifier = Modifier.size(34.dp))
+                          }
+                          Spacer(Modifier.width(14.dp))
+                          Column {
+                              Text("游客", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
+                              Text("观看记录仅保存在本机", fontSize = 13.sp, color = AppColors.TextSecondary)
+                          }
+                      }
+                  }
+
+                  item {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text("观看历史", fontSize = 19.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
+                          Spacer(Modifier.width(8.dp))
+                          Text("${history.size} 部", fontSize = 13.sp, color = AppColors.TextSecondary)
+                          Spacer(Modifier.weight(1f))
+                          if (history.isNotEmpty()) {
+                              Text(
+                                  "清空",
+                                  fontSize = 13.sp,
+                                  color = AppColors.TextSecondary,
+                                  modifier = Modifier.clickable { confirmClear = true },
+                              )
+                          }
+                      }
+                  }
+
+                  if (history.isEmpty()) {
+                      item {
+                          Text(
+                              "还没有观看记录，去首页挑一部吧",
+                              color = AppColors.TextSecondary,
+                              fontSize = 14.sp,
+                              modifier = Modifier.padding(vertical = 24.dp),
+                          )
+                      }
+                  }
+
+                  items(history, key = { it.drama.id }) { h ->
+                      HistoryRow(
+                          item = h,
+                          onPlay = { onPlay(h.drama.id, h.continueEpisode) },
+                          onDetail = { onOpenDrama(h.drama.id) },
+                          onRemove = { repo.remove(h.drama.id) },
+                      )
+                  }
+
+                  item {
+                      Column(
+                          Modifier
+                              .padding(top = 20.dp)
+                              .fillMaxWidth()
+                              .clip(RoundedCornerShape(12.dp))
+                              .background(AppColors.Surface)
+                              .padding(16.dp),
+                          verticalArrangement = Arrangement.spacedBy(6.dp),
+                      ) {
+                          Text("关于测试内容", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
+                          Text(
+                              "当前为第一阶段演示版本：片名、简介均为虚构的模拟数据，海报由程序生成。" +
+                                  "播放使用以下开放授权影片：",
+                              fontSize = 12.sp,
+                              color = AppColors.TextSecondary,
+                          )
+                          TestVideos.all.forEach { v ->
+                              Text("· ${v.credit}", fontSize = 12.sp, color = AppColors.TextSecondary)
+                          }
+                      }
+                  }
+              }
+
+              if (confirmClear) {
+                  AlertDialog(
+                      onDismissRequest = { confirmClear = false },
+                      title = { Text("清空观看历史？") },
+                      text = { Text("所有剧集的观看进度都会被删除，且无法恢复。") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              repo.clear()
+                              confirmClear = false
+                          }) { Text("清空") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { confirmClear = false }) { Text("取消") }
+                      },
+                  )
+              }
+          }
+
+          @Composable
+          private fun HistoryRow(
+              item: HistoryItem,
+              onPlay: () -> Unit,
+              onDetail: () -> Unit,
+              onRemove: () -> Unit,
+          ) {
+              val last = item.progress.last
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(12.dp))
+                      .background(AppColors.Surface)
+                      .clickable(onClick = onPlay)
+                      .padding(10.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Poster(item.drama, Modifier.size(width = 60.dp, height = 82.dp), corner = 8.dp, showTitle = false)
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(
+                          item.drama.title,
+                          color = AppColors.TextPrimary,
+                          fontSize = 15.sp,
+                          fontWeight = FontWeight.SemiBold,
+                          maxLines = 1,
+                          overflow = TextOverflow.Ellipsis,
+                          modifier = Modifier.clickable(onClick = onDetail),
+                      )
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          text = buildString {
+                              append(item.label)
+                              if (last != null && last.durationMs > 0) {
+                                  append(" · ${formatDuration(last.positionMs)} / ${formatDuration(last.durationMs)}")
+                              }
+                          },
+                          color = AppColors.TextSecondary,
+                          fontSize = 12.sp,
+                      )
+                      Spacer(Modifier.height(8.dp))
+                      ProgressStrip(
+                          item.fraction,
+                          Modifier
+                              .fillMaxWidth()
+                              .clip(RoundedCornerShape(2.dp)),
+                      )
+                  }
+                  Spacer(Modifier.width(8.dp))
+                  Icon(
+                      Icons.Filled.Close,
+                      contentDescription = "删除记录",
+                      tint = AppColors.TextSecondary,
+                      modifier = Modifier
+                          .size(20.dp)
+                          .clickable(onClick = onRemove),
+                  )
+              }
+          }
+          __EOF__
+
+          f $S/ui/detail/DetailScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.detail
+
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.navigationBarsPadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.itemsIndexed
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.DramaProgress
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.ProgressPolicy
+          import com.shiguang.video.data.formatDuration
+          import com.shiguang.video.ui.components.DramaCard
+          import com.shiguang.video.ui.components.EmptyState
+          import com.shiguang.video.ui.components.Pill
+          import com.shiguang.video.ui.components.Poster
+          import com.shiguang.video.ui.components.RoundIconButton
+          import com.shiguang.video.ui.components.SectionHeader
+          import com.shiguang.video.ui.components.rememberProgressRepo
+          import com.shiguang.video.ui.theme.AppColors
+
+          private const val EPISODES_PER_PAGE = 30
+          private const val EPISODE_COLUMNS = 6
+
+          @Composable
+          fun DetailScreen(
+              dramaId: String,
+              onBack: () -> Unit,
+              onPlay: (Int) -> Unit,
+              onOpenDrama: (String) -> Unit,
+          ) {
+              val drama = remember(dramaId) { MockCatalog.find(dramaId) }
+              if (drama == null) {
+                  Box(Modifier.fillMaxSize().background(AppColors.Background)) {
+                      EmptyState("内容不存在或已下架")
+                      RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onBack, Modifier.statusBarsPadding().padding(12.dp))
+                  }
+                  return
+              }
+
+              val repo = rememberProgressRepo()
+              val all by repo.all.collectAsStateWithLifecycle()
+              val progress = all[drama.id]
+              val continueEpisode = ProgressPolicy.episodeToContinue(progress, drama.episodeCount)
+              val related = remember(drama) { MockCatalog.related(drama) }
+
+              val pages = remember(drama) { (1..drama.episodeCount).chunked(EPISODES_PER_PAGE) }
+              var page by rememberSaveable(drama.id) { mutableIntStateOf((continueEpisode - 1) / EPISODES_PER_PAGE) }
+
+              Box(
+                  Modifier
+                      .fillMaxSize()
+                      .background(AppColors.Background),
+              ) {
+                  LazyColumn(
+                      contentPadding = PaddingValues(bottom = 110.dp),
+                      verticalArrangement = Arrangement.spacedBy(16.dp),
+                  ) {
+                      item { DetailHeader(drama) }
+
+                      item {
+                          var expanded by rememberSaveable { mutableStateOf(false) }
+                          Text(
+                              text = drama.intro,
+                              color = Color(0xFFC4C4CC),
+                              fontSize = 14.sp,
+                              lineHeight = 21.sp,
+                              maxLines = if (expanded) Int.MAX_VALUE else 3,
+                              overflow = TextOverflow.Ellipsis,
+                              modifier = Modifier
+                                  .padding(horizontal = 20.dp)
+                                  .clickable { expanded = !expanded },
+                          )
+                      }
+
+                      item {
+                          SectionHeader(
+                              title = if (drama.type == ContentType.MOVIE) "播放" else "选集",
+                              extra = drama.episodeText,
+                          )
+                      }
+
+                      if (pages.size > 1) {
+                          item {
+                              LazyRow(
+                                  contentPadding = PaddingValues(horizontal = 20.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                              ) {
+                                  itemsIndexed(pages) { index, range ->
+                                      Pill("${range.first()}-${range.last()}", index == page, { page = index })
+                                  }
+                              }
+                          }
+                      }
+
+                      val pageEpisodes = pages.getOrElse(page) { pages.first() }
+                      items(pageEpisodes.chunked(EPISODE_COLUMNS)) { row ->
+                          Row(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .padding(horizontal = 20.dp),
+                              horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          ) {
+                              row.forEach { ep ->
+                                  EpisodeCell(
+                                      number = ep,
+                                      label = if (drama.type == ContentType.MOVIE) "正片" else ep.toString(),
+                                      progress = progress,
+                                      onClick = { onPlay(ep) },
+                                      modifier = Modifier.weight(1f),
+                                  )
+                              }
+                              repeat(EPISODE_COLUMNS - row.size) { Spacer(Modifier.weight(1f)) }
+                          }
+                      }
+
+                      item { SectionHeader("猜你喜欢", Modifier.padding(top = 8.dp)) }
+                      item {
+                          LazyRow(
+                              contentPadding = PaddingValues(horizontal = 20.dp),
+                              horizontalArrangement = Arrangement.spacedBy(12.dp),
+                          ) {
+                              items(related, key = { it.id }) { d ->
+                                  DramaCard(d, d.heatText, { onOpenDrama(d.id) }, Modifier.width(110.dp))
+                              }
+                          }
+                      }
+                  }
+
+                  RoundIconButton(
+                      Icons.AutoMirrored.Filled.ArrowBack,
+                      "返回",
+                      onBack,
+                      Modifier
+                          .statusBarsPadding()
+                          .padding(12.dp),
+                      background = Color.Black.copy(alpha = 0.35f),
+                  )
+
+                  PlayBar(
+                      drama = drama,
+                      progress = progress,
+                      continueEpisode = continueEpisode,
+                      onPlay = { onPlay(continueEpisode) },
+                      modifier = Modifier.align(Alignment.BottomCenter),
+                  )
+              }
+          }
+
+          @Composable
+          private fun DetailHeader(drama: Drama) {
+              Box(Modifier.fillMaxWidth()) {
+                  // 背景：同一张生成海报放大并压暗
+                  Poster(
+                      drama,
+                      Modifier
+                          .fillMaxWidth()
+                          .aspectRatio(1.1f),
+                      corner = 0.dp,
+                      showTitle = false,
+                  )
+                  Box(
+                      Modifier
+                          .matchParentSize()
+                          .background(
+                              Brush.verticalGradient(
+                                  listOf(Color.Black.copy(alpha = 0.3f), AppColors.Background),
+                              ),
+                          ),
+                  )
+                  Row(
+                      Modifier
+                          .align(Alignment.BottomStart)
+                          .padding(horizontal = 20.dp),
+                      verticalAlignment = Alignment.Bottom,
+                  ) {
+                      Poster(drama, Modifier.size(width = 120.dp, height = 166.dp))
+                      Spacer(Modifier.width(16.dp))
+                      Column(Modifier.weight(1f)) {
+                          Text(drama.title, fontSize = 22.sp, fontWeight = FontWeight.Black, color = AppColors.TextPrimary)
+                          Spacer(Modifier.height(6.dp))
+                          Text(
+                              "${drama.year} · ${drama.region} · ${drama.type.label} · ${drama.episodeText}",
+                              fontSize = 12.sp,
+                              color = AppColors.TextSecondary,
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                              drama.genres.forEach { g ->
+                                  Text(
+                                      g,
+                                      fontSize = 11.sp,
+                                      color = AppColors.TextPrimary,
+                                      modifier = Modifier
+                                          .clip(RoundedCornerShape(4.dp))
+                                          .background(Color.White.copy(alpha = 0.12f))
+                                          .padding(horizontal = 6.dp, vertical = 2.dp),
+                                  )
+                              }
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          Row(verticalAlignment = Alignment.Bottom) {
+                              Text("${drama.score}", fontSize = 24.sp, fontWeight = FontWeight.Black, color = Color(0xFFFFC53D))
+                              Text(" 分", fontSize = 12.sp, color = Color(0xFFFFC53D), modifier = Modifier.padding(bottom = 4.dp))
+                              Spacer(Modifier.width(12.dp))
+                              Text(drama.heatText, fontSize = 12.sp, color = AppColors.TextSecondary, modifier = Modifier.padding(bottom = 4.dp))
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun EpisodeCell(
+              number: Int,
+              label: String,
+              progress: DramaProgress?,
+              onClick: () -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              val ep = progress?.episodes?.get(number)
+              val isLast = progress?.lastEpisode == number
+              val finished = ep?.finished == true
+              val shape = RoundedCornerShape(8.dp)
+              Box(
+                  modifier
+                      .aspectRatio(1f)
+                      .clip(shape)
+                      .background(AppColors.SurfaceHigh)
+                      .then(if (isLast) Modifier.border(1.5.dp, AppColors.Accent, shape) else Modifier)
+                      .clickable(onClick = onClick),
+                  contentAlignment = Alignment.Center,
+              ) {
+                  Text(
+                      text = label,
+                      fontSize = 15.sp,
+                      fontWeight = if (isLast) FontWeight.Bold else FontWeight.Medium,
+                      color = when {
+                          isLast -> AppColors.Accent
+                          finished -> AppColors.TextSecondary
+                          else -> AppColors.TextPrimary
+                      },
+                  )
+                  if (finished) {
+                      Text(
+                          "已看",
+                          fontSize = 8.sp,
+                          color = AppColors.TextSecondary,
+                          modifier = Modifier
+                              .align(Alignment.TopEnd)
+                              .padding(3.dp),
+                      )
+                  } else if (ep != null && ep.fraction > 0f) {
+                      Box(
+                          Modifier
+                              .align(Alignment.BottomStart)
+                              .fillMaxWidth(ep.fraction)
+                              .height(3.dp)
+                              .background(AppColors.Accent),
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun PlayBar(
+              drama: Drama,
+              progress: DramaProgress?,
+              continueEpisode: Int,
+              onPlay: () -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              val resumeAt = ProgressPolicy.resumePositionMs(progress?.episodes?.get(continueEpisode))
+              val epName = if (drama.type == ContentType.MOVIE) "" else " 第${continueEpisode}集"
+              val text = when {
+                  progress == null -> "立即播放$epName"
+                  resumeAt > 0 -> "继续观看$epName · ${formatDuration(resumeAt)}"
+                  else -> "播放$epName"
+              }
+              Box(
+                  modifier
+                      .fillMaxWidth()
+                      .background(Brush.verticalGradient(listOf(Color.Transparent, AppColors.Background)))
+                      .navigationBarsPadding()
+                      .padding(horizontal = 20.dp, vertical = 14.dp),
+              ) {
+                  Row(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(50.dp)
+                          .clip(RoundedCornerShape(50))
+                          .background(AppColors.Accent)
+                          .clickable(onClick = onPlay),
+                      horizontalArrangement = Arrangement.Center,
+                      verticalAlignment = Alignment.CenterVertically,
+                  ) {
+                      Icon(Icons.Filled.PlayArrow, null, tint = Color.White)
+                      Spacer(Modifier.width(6.dp))
+                      Text(text, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                  }
+              }
+          }
+          __EOF__
+
+      - name: Generate player
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/ui/player/PlayerViewModel.kt <<'__EOF__'
+          package com.shiguang.video.ui.player
+
+          import android.app.Application
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import androidx.media3.common.AudioAttributes
+          import androidx.media3.common.C
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MediaMetadata
+          import androidx.media3.common.PlaybackException
+          import androidx.media3.common.Player
+          import androidx.media3.exoplayer.ExoPlayer
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.ProgressPolicy
+          import com.shiguang.video.data.WatchProgressRepository
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.update
+          import kotlinx.coroutines.isActive
+          import kotlinx.coroutines.launch
+
+          data class PlayerUiState(
+              val episode: Int,
+              val autoNext: Boolean = true,
+              val error: String? = null,
+              /** 本次是从多少毫秒处续播的，用于给出提示；0 表示从头播放 */
+              val resumedFromMs: Long = 0L,
+          )
+
+          /**
+           * 播放器放在 ViewModel 里，横竖屏切换、界面重组都不会打断播放。
+           * 进度保存时机：每 5 秒、暂停、切集、播完、进入后台、离开页面。
+           */
+          class PlayerViewModel(
+              app: Application,
+              private val repo: WatchProgressRepository,
+              val drama: Drama,
+              startEpisode: Int,
+          ) : AndroidViewModel(app) {
+
+              val player: ExoPlayer = ExoPlayer.Builder(app).build().apply {
+                  setAudioAttributes(
+                      AudioAttributes.Builder()
+                          .setUsage(C.USAGE_MEDIA)
+                          .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                          .build(),
+                      /* handleAudioFocus = */ true,
+                  )
+                  setHandleAudioBecomingNoisy(true)
+              }
+
+              private val _ui = MutableStateFlow(PlayerUiState(episode = startEpisode.coerceIn(1, drama.episodeCount)))
+              val ui: StateFlow<PlayerUiState> = _ui.asStateFlow()
+
+              private val currentEpisode: Int get() = _ui.value.episode
+
+              private val listener = object : Player.Listener {
+                  override fun onPlaybackStateChanged(playbackState: Int) {
+                      when (playbackState) {
+                          // 一开始能播就写入记录，保证“继续观看”立刻出现
+                          Player.STATE_READY -> saveProgress()
+                          Player.STATE_ENDED -> onEnded()
+                          else -> Unit
+                      }
+                  }
+
+                  override fun onIsPlayingChanged(isPlaying: Boolean) {
+                      if (!isPlaying) saveProgress()
+                  }
+
+                  override fun onPlayerError(error: PlaybackException) {
+                      _ui.update { it.copy(error = "播放失败：${error.errorCodeName}") }
+                  }
+              }
+
+              init {
+                  player.addListener(listener)
+                  load(currentEpisode)
+                  viewModelScope.launch {
+                      while (isActive) {
+                          delay(SAVE_INTERVAL_MS)
+                          if (player.isPlaying) saveProgress()
+                      }
+                  }
+              }
+
+              fun playEpisode(number: Int) {
+                  if (number !in 1..drama.episodeCount || number == currentEpisode) return
+                  saveProgress()
+                  load(number)
+              }
+
+              fun setAutoNext(enabled: Boolean) {
+                  _ui.update { it.copy(autoNext = enabled) }
+              }
+
+              fun retry() {
+                  _ui.update { it.copy(error = null) }
+                  player.prepare()
+                  player.play()
+              }
+
+              fun onBackground() {
+                  saveProgress()
+                  player.pause()
+              }
+
+              private fun load(number: Int) {
+                  val episode = MockCatalog.episode(drama, number)
+                  val start = ProgressPolicy.resumePositionMs(repo.episode(drama.id, number))
+                  _ui.update { it.copy(episode = number, error = null, resumedFromMs = start) }
+
+                  val item = MediaItem.Builder()
+                      .setUri(episode.video.url)
+                      .setMediaId(mediaId(number))
+                      .setMediaMetadata(
+                          MediaMetadata.Builder()
+                              .setTitle("${drama.title} ${episode.title}")
+                              .build(),
+                      )
+                      .build()
+                  player.setMediaItem(item, start)
+                  player.prepare()
+                  player.playWhenReady = true
+              }
+
+              private fun onEnded() {
+                  val duration = player.duration
+                  if (duration != C.TIME_UNSET && duration > 0) {
+                      repo.save(drama.id, currentEpisode, duration, duration)
+                  }
+                  if (_ui.value.autoNext && currentEpisode < drama.episodeCount) {
+                      load(currentEpisode + 1)
+                  }
+              }
+
+              private fun saveProgress() {
+                  // 切集过程中旧回调可能晚到，只记录与当前集匹配的媒体
+                  if (player.currentMediaItem?.mediaId != mediaId(currentEpisode)) return
+                  val duration = player.duration.takeIf { it != C.TIME_UNSET } ?: 0L
+                  repo.save(drama.id, currentEpisode, player.currentPosition, duration)
+              }
+
+              private fun mediaId(number: Int) = "${drama.id}#$number"
+
+              override fun onCleared() {
+                  saveProgress()
+                  player.removeListener(listener)
+                  player.release()
+              }
+
+              private companion object {
+                  const val SAVE_INTERVAL_MS = 5_000L
+              }
+          }
+          __EOF__
+
+          f $S/ui/player/PlayerScreen.kt <<'__EOF__'
+          package com.shiguang.video.ui.player
+
+          import android.content.pm.ActivityInfo
+          import androidx.activity.compose.BackHandler
+          import androidx.annotation.OptIn
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.navigationBarsPadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.GridItemSpan
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.SwitchDefaults
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.DisposableEffect
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.viewinterop.AndroidView
+          import androidx.core.view.WindowCompat
+          import androidx.core.view.WindowInsetsCompat
+          import androidx.core.view.WindowInsetsControllerCompat
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.lifecycle.compose.LocalLifecycleOwner
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import androidx.lifecycle.viewmodel.compose.viewModel
+          import androidx.media3.common.util.UnstableApi
+          import androidx.media3.ui.PlayerView
+          import com.shiguang.video.app
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.DramaProgress
+          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.formatDuration
+          import com.shiguang.video.findActivity
+          import com.shiguang.video.ui.components.EmptyState
+          import com.shiguang.video.ui.components.RoundIconButton
+          import com.shiguang.video.ui.theme.AppColors
+          import kotlinx.coroutines.delay
+
+          @Composable
+          fun PlayerScreen(
+              dramaId: String,
+              startEpisode: Int,
+              onBack: () -> Unit,
+          ) {
+              val drama = remember(dramaId) { MockCatalog.find(dramaId) }
+              if (drama == null) {
+                  Box(Modifier.fillMaxSize().background(Color.Black)) {
+                      EmptyState("内容不存在或已下架")
+                      RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onBack, Modifier.statusBarsPadding().padding(12.dp))
+                  }
+                  return
+              }
+
+              val context = LocalContext.current
+              val app = context.app
+              val vm: PlayerViewModel = viewModel { PlayerViewModel(app, app.progressRepo, drama, startEpisode) }
+              val ui by vm.ui.collectAsStateWithLifecycle()
+              val allProgress by app.progressRepo.all.collectAsStateWithLifecycle()
+
+              var fullscreen by rememberSaveable { mutableStateOf(false) }
+
+              // 进入后台时保存进度并暂停
+              val lifecycleOwner = LocalLifecycleOwner.current
+              DisposableEffect(lifecycleOwner) {
+                  val observer = LifecycleEventObserver { _, event ->
+                      if (event == Lifecycle.Event.ON_STOP) vm.onBackground()
+                  }
+                  lifecycleOwner.lifecycle.addObserver(observer)
+                  onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+              }
+
+              // 全屏：横屏 + 隐藏系统栏；离开页面时恢复
+              DisposableEffect(fullscreen) {
+                  val activity = context.findActivity()
+                  val window = activity?.window
+                  if (activity != null && window != null) {
+                      val controller = WindowCompat.getInsetsController(window, window.decorView)
+                      if (fullscreen) {
+                          activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                          controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                          controller.hide(WindowInsetsCompat.Type.systemBars())
+                      } else {
+                          activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                          controller.show(WindowInsetsCompat.Type.systemBars())
+                      }
+                  }
+                  onDispose {
+                      if (fullscreen && activity != null && window != null) {
+                          activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                          WindowCompat.getInsetsController(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
+                      }
+                  }
+              }
+              BackHandler(enabled = fullscreen) { fullscreen = false }
+
+              var resumeHint by remember { mutableStateOf<String?>(null) }
+              LaunchedEffect(ui.episode, ui.resumedFromMs) {
+                  if (ui.resumedFromMs > 0) {
+                      resumeHint = "已为你从 ${formatDuration(ui.resumedFromMs)} 继续播放"
+                      delay(3_000)
+                  }
+                  resumeHint = null
+              }
+
+              val episodeLabel = if (drama.type == ContentType.MOVIE) "正片" else "第${ui.episode}集"
+
+              Column(
+                  Modifier
+                      .fillMaxSize()
+                      .background(Color.Black),
+              ) {
+                  if (!fullscreen) {
+                      Row(
+                          Modifier
+                              .statusBarsPadding()
+                              .padding(horizontal = 8.dp, vertical = 6.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onBack, size = 40.dp, background = Color.Transparent)
+                          Text(
+                              "${drama.title} · $episodeLabel",
+                              color = AppColors.TextPrimary,
+                              fontSize = 16.sp,
+                              fontWeight = FontWeight.SemiBold,
+                              maxLines = 1,
+                              overflow = TextOverflow.Ellipsis,
+                          )
+                      }
+                  }
+
+                  Box(
+                      if (fullscreen) {
+                          Modifier.fillMaxSize()
+                      } else {
+                          Modifier
+                              .fillMaxWidth()
+                              .aspectRatio(16f / 9f)
+                      },
+                  ) {
+                      VideoSurface(
+                          vm = vm,
+                          fullscreen = fullscreen,
+                          onFullscreenChange = { fullscreen = it },
+                          modifier = Modifier.fillMaxSize(),
+                      )
+
+                      resumeHint?.let { hint ->
+                          Text(
+                              hint,
+                              color = Color.White,
+                              fontSize = 12.sp,
+                              modifier = Modifier
+                                  .align(Alignment.BottomStart)
+                                  .padding(start = 12.dp, bottom = 56.dp)
+                                  .clip(RoundedCornerShape(50))
+                                  .background(Color.Black.copy(alpha = 0.6f))
+                                  .padding(horizontal = 12.dp, vertical = 6.dp),
+                          )
+                      }
+
+                      ui.error?.let { message ->
+                          Column(
+                              Modifier
+                                  .matchParentSize()
+                                  .background(Color.Black.copy(alpha = 0.75f)),
+                              verticalArrangement = Arrangement.Center,
+                              horizontalAlignment = Alignment.CenterHorizontally,
+                          ) {
+                              Text(message, color = Color.White, fontSize = 14.sp)
+                              Text("请检查网络后重试", color = AppColors.TextSecondary, fontSize = 12.sp)
+                              TextButton(onClick = vm::retry) { Text("重试", color = AppColors.Accent) }
+                          }
+                      }
+                  }
+
+                  if (!fullscreen) {
+                      EpisodePanel(
+                          drama = drama,
+                          currentEpisode = ui.episode,
+                          progress = allProgress[drama.id],
+                          autoNext = ui.autoNext,
+                          onAutoNextChange = vm::setAutoNext,
+                          onSelect = vm::playEpisode,
+                          modifier = Modifier
+                              .weight(1f)
+                              .background(AppColors.Background),
+                      )
+                  }
+              }
+          }
+
+          @OptIn(UnstableApi::class)
+          @Composable
+          private fun VideoSurface(
+              vm: PlayerViewModel,
+              fullscreen: Boolean,
+              onFullscreenChange: (Boolean) -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              AndroidView(
+                  factory = { ctx ->
+                      PlayerView(ctx).apply {
+                          player = vm.player
+                          keepScreenOn = true
+                          setShowNextButton(false)
+                          setShowPreviousButton(false)
+                          setFullscreenButtonClickListener { isFullscreen -> onFullscreenChange(isFullscreen) }
+                      }
+                  },
+                  update = { view ->
+                      view.setFullscreenButtonState(fullscreen)
+                      view.setFullscreenButtonClickListener { isFullscreen -> onFullscreenChange(isFullscreen) }
+                  },
+                  onRelease = { view -> view.player = null },
+                  modifier = modifier,
+              )
+          }
+
+          @Composable
+          private fun EpisodePanel(
+              drama: Drama,
+              currentEpisode: Int,
+              progress: DramaProgress?,
+              autoNext: Boolean,
+              onAutoNextChange: (Boolean) -> Unit,
+              onSelect: (Int) -> Unit,
+              modifier: Modifier = Modifier,
+          ) {
+              val episode = remember(drama, currentEpisode) { MockCatalog.episode(drama, currentEpisode) }
+
+              LazyVerticalGrid(
+                  columns = GridCells.Fixed(6),
+                  modifier = modifier,
+                  contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 24.dp),
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                  item(span = { GridItemSpan(maxLineSpan) }) {
+                      Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Text(drama.title, color = AppColors.TextPrimary, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                          Text(
+                              "${drama.type.label} · ${drama.genres.joinToString(" · ")} · ${drama.episodeText}",
+                              color = AppColors.TextSecondary,
+                              fontSize = 12.sp,
+                          )
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Text(
+                                  if (drama.episodeCount > 1) "选集" else "播放",
+                                  color = AppColors.TextPrimary,
+                                  fontSize = 16.sp,
+                                  fontWeight = FontWeight.Bold,
+                              )
+                              Spacer(Modifier.weight(1f))
+                              if (drama.episodeCount > 1) {
+                                  Text("自动连播", color = AppColors.TextSecondary, fontSize = 13.sp)
+                                  Spacer(Modifier.width(6.dp))
+                                  Switch(
+                                      checked = autoNext,
+                                      onCheckedChange = onAutoNextChange,
+                                      colors = SwitchDefaults.colors(checkedTrackColor = AppColors.Accent),
+                                  )
+                              }
+                          }
+                      }
+                  }
+
+                  items((1..drama.episodeCount).toList(), key = { it }) { number ->
+                      val ep = progress?.episodes?.get(number)
+                      val isCurrent = number == currentEpisode
+                      val shape = RoundedCornerShape(8.dp)
+                      Box(
+                          Modifier
+                              .aspectRatio(1f)
+                              .clip(shape)
+                              .background(if (isCurrent) AppColors.Accent.copy(alpha = 0.18f) else AppColors.SurfaceHigh)
+                              .then(if (isCurrent) Modifier.border(1.5.dp, AppColors.Accent, shape) else Modifier)
+                              .clickable { onSelect(number) },
+                          contentAlignment = Alignment.Center,
+                      ) {
+                          Text(
+                              text = if (drama.type == ContentType.MOVIE) "正片" else number.toString(),
+                              color = when {
+                                  isCurrent -> AppColors.Accent
+                                  ep?.finished == true -> AppColors.TextSecondary
+                                  else -> AppColors.TextPrimary
+                              },
+                              fontSize = 14.sp,
+                              fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                          )
+                          if (!isCurrent && ep != null && !ep.finished && ep.fraction > 0f) {
+                              Box(
+                                  Modifier
+                                      .align(Alignment.BottomStart)
+                                      .fillMaxWidth(ep.fraction)
+                                      .height(3.dp)
+                                      .background(AppColors.Accent),
+                              )
+                          }
+                      }
+                  }
+
+                  item(span = { GridItemSpan(maxLineSpan) }) {
+                      Text(
+                          "测试片源：${episode.video.credit}",
+                          color = AppColors.TextSecondary.copy(alpha = 0.7f),
+                          fontSize = 11.sp,
+                          modifier = Modifier
+                              .padding(top = 12.dp)
+                              .navigationBarsPadding(),
+                      )
+                  }
+              }
+          }
+          __EOF__
+
+      # 固定签名缓存在 Actions 里，每次构建的 APK 都能直接覆盖安装
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: keystore/debug.jks
+          key: shiguang-debug-keystore-v1
+
+      - name: Create signing key if missing
+        run: |
+          if [ ! -f keystore/debug.jks ]; then
+            mkdir -p keystore
+            keytool -genkeypair -keystore keystore/debug.jks -storepass android -alias androiddebugkey \
+              -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Unit tests
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Build APK
+        run: gradle :app:assembleDebug -PversionCode=${{ github.run_number }} -PversionName=0.1.${{ github.run_number }} --stacktrace
+
+      - name: Rename APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/shiguang-video-v0.1.${{ github.run_number }}.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shiguang-video-apk
+          path: dist/*.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: 拾光影视 v0.1.${{ github.run_number }}
+          files: dist/*.apk
+          make_latest: true
+          body: 手机下载下方 APK 安装。测试视频来自 Blender 基金会开放电影（CC BY）。
