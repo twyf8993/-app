@@ -94,9 +94,18 @@ jobs:
 
               buildTypes {
                   release {
-                      isMinifyEnabled = false
+                      // 正式包开启 R8 优化，Compose 界面比调试包流畅得多
+                      isMinifyEnabled = true
+                      isShrinkResources = true
                       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                      // 沿用同一把签名，能直接覆盖安装之前的调试包，观看记录不会丢
+                      signingConfig = signingConfigs.getByName("debug")
                   }
+              }
+
+              lint {
+                  // 省掉正式包构建前的检查，CI 构建快几分钟
+                  checkReleaseBuilds = false
               }
 
               compileOptions {
@@ -138,7 +147,7 @@ jobs:
           __EOF__
 
           f app/proguard-rules.pro <<'__EOF__'
-          # 第一阶段未开启混淆，预留文件。
+          # 正式包开启了 R8。项目没有用反射，依赖库（Compose、Media3、Navigation）都自带混淆规则，这里不需要额外配置。
           __EOF__
 
           f app/src/main/AndroidManifest.xml <<'__EOF__'
@@ -867,11 +876,9 @@ jobs:
           f $S/ui/components/Poster.kt <<'__EOF__'
           package com.shiguang.video.ui.components
 
-          import androidx.compose.foundation.Canvas
           import androidx.compose.foundation.background
-          import androidx.compose.foundation.layout.BoxWithConstraints
+          import androidx.compose.foundation.layout.Box
           import androidx.compose.foundation.layout.fillMaxWidth
-          import androidx.compose.foundation.layout.offset
           import androidx.compose.foundation.layout.padding
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material3.Text
@@ -879,14 +886,18 @@ jobs:
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.drawWithCache
           import androidx.compose.ui.geometry.Offset
           import androidx.compose.ui.graphics.Brush
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.Shadow
           import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.drawText
           import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.rememberTextMeasurer
           import androidx.compose.ui.text.style.TextAlign
           import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.Constraints
           import androidx.compose.ui.unit.Dp
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
@@ -908,6 +919,7 @@ jobs:
 
           /**
            * 程序生成的占位海报：渐变底色 + 几何纹理 + 片名水印。
+           * 底图和文字都在一次绘制里完成，只在尺寸或内容变化时重新排版，列表滚动时开销很小。
            * 后续接入真实素材时，把这里替换成网络图片加载即可。
            */
           @Composable
@@ -921,65 +933,82 @@ jobs:
           ) {
               val colors = PosterPalettes[drama.posterSeed.mod(PosterPalettes.size)]
               val variant = drama.posterSeed % 3
-              BoxWithConstraints(
+              val textMeasurer = rememberTextMeasurer()
+              Box(
                   modifier
                       .clip(RoundedCornerShape(corner))
-                      .background(Brush.linearGradient(colors)),
-              ) {
-                  val width = maxWidth.value
-                  Canvas(Modifier.matchParentSize()) {
-                      val r = size.minDimension
-                      when (variant) {
-                          0 -> {
-                              drawCircle(Color.White.copy(alpha = 0.12f), r * 0.55f, Offset(size.width * 0.85f, size.height * 0.18f))
-                              drawCircle(Color.White.copy(alpha = 0.06f), r * 0.85f, Offset(size.width * 0.05f, size.height * 0.7f))
+                      .drawWithCache {
+                          val w = size.width
+                          val h = size.height
+                          val r = size.minDimension
+                          val widthDp = w.toDp().value
+                          val background = Brush.linearGradient(colors)
+                          val shade = Brush.verticalGradient(
+                              listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f)),
+                              startY = h * 0.45f,
+                              endY = h,
+                          )
+                          val mark = textMeasurer.measure(
+                              drama.title.take(1),
+                              TextStyle(
+                                  color = Color.White.copy(alpha = 0.16f),
+                                  fontSize = (widthDp * 0.62f).sp,
+                                  fontWeight = FontWeight.Black,
+                              ),
+                          )
+                          val sidePadding = 8.dp.toPx()
+                          val title = if (showTitle) {
+                              textMeasurer.measure(
+                                  drama.title,
+                                  TextStyle(
+                                      color = Color.White,
+                                      fontSize = widthDp.times(0.12f).coerceIn(11f, 28f).sp,
+                                      lineHeight = widthDp.times(0.15f).coerceIn(14f, 34f).sp,
+                                      fontWeight = FontWeight.ExtraBold,
+                                      textAlign = TextAlign.Center,
+                                  ),
+                                  overflow = TextOverflow.Ellipsis,
+                                  maxLines = 2,
+                                  constraints = Constraints.fixedWidth((w - sidePadding * 2).toInt().coerceAtLeast(0)),
+                              )
+                          } else {
+                              null
                           }
-                          1 -> {
-                              drawCircle(Color.White.copy(alpha = 0.10f), r * 0.35f, Offset(size.width * 0.5f, size.height * 0.32f))
-                              drawCircle(Color.White.copy(alpha = 0.05f), r * 0.6f, Offset(size.width * 0.5f, size.height * 0.32f))
-                          }
-                          else -> {
-                              for (i in 0..5) {
-                                  val y = size.height * (0.1f + i * 0.09f)
-                                  drawLine(Color.White.copy(alpha = 0.07f), Offset(0f, y + size.width * 0.3f), Offset(size.width, y), strokeWidth = r * 0.03f)
+                          val titleShadow = Shadow(Color.Black.copy(alpha = 0.6f), Offset(0f, 2f), 6f)
+
+                          onDrawBehind {
+                              drawRect(background)
+                              when (variant) {
+                                  0 -> {
+                                      drawCircle(Color.White.copy(alpha = 0.12f), r * 0.55f, Offset(w * 0.85f, h * 0.18f))
+                                      drawCircle(Color.White.copy(alpha = 0.06f), r * 0.85f, Offset(w * 0.05f, h * 0.7f))
+                                  }
+                                  1 -> {
+                                      drawCircle(Color.White.copy(alpha = 0.10f), r * 0.35f, Offset(w * 0.5f, h * 0.32f))
+                                      drawCircle(Color.White.copy(alpha = 0.05f), r * 0.6f, Offset(w * 0.5f, h * 0.32f))
+                                  }
+                                  else -> {
+                                      for (i in 0..5) {
+                                          val y = h * (0.1f + i * 0.09f)
+                                          drawLine(Color.White.copy(alpha = 0.07f), Offset(0f, y + w * 0.3f), Offset(w, y), strokeWidth = r * 0.03f)
+                                      }
+                                  }
+                              }
+                              drawRect(shade)
+                              drawText(
+                                  mark,
+                                  topLeft = Offset((w - mark.size.width) / 2f, (h - mark.size.height) / 2f - h * 0.1f),
+                              )
+                              if (title != null) {
+                                  drawText(
+                                      title,
+                                      topLeft = Offset(sidePadding, h - w * 0.08f - title.size.height),
+                                      shadow = titleShadow,
+                                  )
                               }
                           }
-                      }
-                      drawRect(
-                          Brush.verticalGradient(
-                              listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f)),
-                              startY = size.height * 0.45f,
-                              endY = size.height,
-                          ),
-                      )
-                  }
-
-                  Text(
-                      text = drama.title.take(1),
-                      modifier = Modifier.align(Alignment.Center).offset(y = (-maxHeight.value * 0.1f).dp),
-                      color = Color.White.copy(alpha = 0.16f),
-                      fontSize = (width * 0.62f).sp,
-                      fontWeight = FontWeight.Black,
-                  )
-
-                  if (showTitle) {
-                      Text(
-                          text = drama.title,
-                          modifier = Modifier
-                              .align(Alignment.BottomCenter)
-                              .fillMaxWidth()
-                              .padding(horizontal = 8.dp, vertical = (width * 0.08f).dp),
-                          color = Color.White,
-                          fontSize = (width * 0.12f).coerceIn(11f, 28f).sp,
-                          lineHeight = (width * 0.15f).coerceIn(14f, 34f).sp,
-                          fontWeight = FontWeight.ExtraBold,
-                          textAlign = TextAlign.Center,
-                          maxLines = 2,
-                          overflow = TextOverflow.Ellipsis,
-                          style = TextStyle(shadow = Shadow(Color.Black.copy(alpha = 0.6f), Offset(0f, 2f), 6f)),
-                      )
-                  }
-
+                      },
+              ) {
                   if (badge != null) {
                       Text(
                           text = badge,
@@ -1266,6 +1295,11 @@ jobs:
           f $S/ui/AppNav.kt <<'__EOF__'
           package com.shiguang.video.ui
 
+          import androidx.compose.animation.core.tween
+          import androidx.compose.animation.fadeIn
+          import androidx.compose.animation.fadeOut
+          import androidx.compose.animation.slideInHorizontally
+          import androidx.compose.animation.slideOutHorizontally
           import androidx.compose.runtime.Composable
           import androidx.navigation.NavType
           import androidx.navigation.compose.NavHost
@@ -1285,11 +1319,21 @@ jobs:
               fun player(id: String, episode: Int) = "player/$id/$episode"
           }
 
+          // 默认转场是 0.7 秒淡入淡出，点开详情要等很久，改成短促的滑入
+          private const val TRANSITION_MS = 220
+
           @Composable
           fun AppNavHost() {
               val nav = rememberNavController()
 
-              NavHost(navController = nav, startDestination = Routes.MAIN) {
+              NavHost(
+                  navController = nav,
+                  startDestination = Routes.MAIN,
+                  enterTransition = { slideInHorizontally(tween(TRANSITION_MS)) { it / 5 } + fadeIn(tween(TRANSITION_MS)) },
+                  exitTransition = { fadeOut(tween(TRANSITION_MS)) },
+                  popEnterTransition = { fadeIn(tween(TRANSITION_MS)) },
+                  popExitTransition = { slideOutHorizontally(tween(TRANSITION_MS)) { it / 5 } + fadeOut(tween(TRANSITION_MS)) },
+              ) {
                   composable(Routes.MAIN) {
                       MainScreen(
                           onOpenDrama = { id -> nav.navigate(Routes.detail(id)) },
@@ -3324,15 +3368,16 @@ jobs:
           gradle-version: "8.11.1"
 
       - name: Unit tests
-        run: gradle :app:testDebugUnitTest --stacktrace
+        run: gradle :app:testReleaseUnitTest --stacktrace
 
+      # 正式包（release）经过 R8 优化，比调试包流畅
       - name: Build APK
-        run: gradle :app:assembleDebug -PversionCode=${{ github.run_number }} -PversionName=0.1.${{ github.run_number }} --stacktrace
+        run: gradle :app:assembleRelease -PversionCode=${{ github.run_number }} -PversionName=0.1.${{ github.run_number }} --stacktrace
 
       - name: Rename APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/shiguang-video-v0.1.${{ github.run_number }}.apk
+          cp app/build/outputs/apk/release/app-release.apk dist/shiguang-video-v0.1.${{ github.run_number }}.apk
 
       - uses: actions/upload-artifact@v4
         with:
