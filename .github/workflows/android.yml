@@ -142,6 +142,9 @@ jobs:
               implementation("androidx.media3:media3-exoplayer:1.5.1")
               implementation("androidx.media3:media3-ui:1.5.1")
 
+              // 网络封面加载；没有封面或加载失败时回退到程序生成的海报
+              implementation("io.coil-kt:coil-compose:2.7.0")
+
               testImplementation("junit:junit:4.13.2")
           }
           __EOF__
@@ -208,6 +211,7 @@ jobs:
               android:height="108dp"
               android:viewportWidth="108"
               android:viewportHeight="108">
+              <!-- 圆角屏幕 + 播放三角 -->
               <path
                   android:fillColor="#FFE8505B"
                   android:pathData="M34,38h40a6,6 0,0 1,6 6v22a6,6 0,0 1,-6 6h-40a6,6 0,0 1,-6 -6v-22a6,6 0,0 1,6 -6z" />
@@ -219,6 +223,7 @@ jobs:
 
           f app/src/main/res/drawable/ic_launcher.xml <<'__EOF__'
           <?xml version="1.0" encoding="utf-8"?>
+          <!-- API 24-25 使用的普通矢量图标 -->
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="48dp"
               android:height="48dp"
@@ -274,6 +279,8 @@ jobs:
               val intro: String,
               /** 决定程序生成海报的配色与纹理，不使用任何真实海报 */
               val posterSeed: Int,
+              /** 封面地址，由数据源提供；为空或加载失败时回退到程序生成的海报 */
+              val coverUrl: String? = null,
           ) {
               val heatText: String get() = "${heat}万热度"
 
@@ -578,6 +585,555 @@ jobs:
           }
           __EOF__
 
+      - name: Generate content sources
+        run: |
+          f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
+          S=app/src/main/java/com/shiguang/video
+
+          f $S/data/source/ContentSource.kt <<'__EOF__'
+          package com.shiguang.video.data.source
+
+          import com.shiguang.video.data.ContentType
+          import com.shiguang.video.data.Drama
+
+          /**
+           * 片库数据源。界面只依赖这个接口，换成真实接口时新增一个实现即可，不改界面代码。
+           *
+           * 实现方只能通过官方或已获授权的渠道取数据：不伪造设备身份、不复现客户端签名、
+           * 不绕过登录、付费、DRM 或频率限制。遇到这些限制时返回对应的 [SourceError]，
+           * 由界面提示用户，而不是想办法绕过去。
+           */
+          interface ContentSource {
+              val info: SourceInfo
+
+              /** 按类型、题材筛选并排序，首页、分类、榜单共用 */
+              suspend fun catalog(query: CatalogQuery, cursor: String? = null): SourceResult<Page<Drama>>
+
+              suspend fun search(keyword: String, cursor: String? = null): SourceResult<Page<Drama>>
+
+              suspend fun hotKeywords(): SourceResult<List<String>>
+
+              suspend fun genres(): SourceResult<List<String>>
+
+              suspend fun series(id: String): SourceResult<Drama>
+
+              suspend fun related(id: String, limit: Int = 8): SourceResult<List<Drama>>
+
+              suspend fun episodes(id: String, cursor: String? = null): SourceResult<Page<EpisodeInfo>>
+
+              /** 取某一集的播放地址。返回的地址可能会过期，播放前用 [PlaybackGuard] 检查 */
+              suspend fun playback(id: String, episode: Int): SourceResult<Playback>
+          }
+
+          data class SourceInfo(
+              val name: String,
+              /** 内容来源与授权说明，显示给用户 */
+              val licenseNote: String,
+          )
+
+          enum class CatalogSort { HOT, NEWEST, SCORE }
+
+          data class CatalogQuery(
+              val type: ContentType? = null,
+              val genre: String? = null,
+              val sort: CatalogSort = CatalogSort.HOT,
+          )
+
+          data class Page<out T>(
+              val items: List<T>,
+              /** 下一页的游标，为空表示没有更多 */
+              val nextCursor: String?,
+          ) {
+              val hasMore: Boolean get() = nextCursor != null
+          }
+
+          enum class EpisodeAccess {
+              FREE,
+
+              /** 需要用户在官方渠道登录 */
+              LOGIN_REQUIRED,
+
+              /** 需要会员或单集付费 */
+              PAID,
+          }
+
+          data class EpisodeInfo(
+              val dramaId: String,
+              val number: Int,
+              val title: String,
+              val access: EpisodeAccess = EpisodeAccess.FREE,
+          )
+
+          data class VideoStream(
+              val url: String,
+              /** 画面高度，未知时为空 */
+              val height: Int? = null,
+              /** 加密流需要授权方提供的许可服务器才能播放，本应用不自行解密 */
+              val protected: Boolean = false,
+          )
+
+          data class Playback(
+              val dramaId: String,
+              val episode: Int,
+              val streams: List<VideoStream>,
+              /** 片源署名，按授权要求显示在播放页 */
+              val credit: String? = null,
+              /** 地址过期时间（毫秒时间戳），为空表示不过期 */
+              val expiresAtMillis: Long? = null,
+          )
+
+          sealed interface SourceError {
+              data object NotFound : SourceError
+
+              data class BadRequest(val message: String) : SourceError
+
+              data object LoginRequired : SourceError
+
+              data object PaymentRequired : SourceError
+
+              data object DrmProtected : SourceError
+
+              /** 播放地址已过期，需要重新请求 */
+              data object Expired : SourceError
+
+              data class RateLimited(val retryAfterSeconds: Long? = null) : SourceError
+
+              data class Network(val cause: Throwable? = null) : SourceError
+
+              data class Server(val code: Int, val message: String? = null) : SourceError
+          }
+
+          /** 只有频率限制和网络错误值得稍后重试，其余错误重试也不会变 */
+          val SourceError.retryable: Boolean
+              get() = this is SourceError.RateLimited || this is SourceError.Network
+
+          /** 给用户看的提示文案 */
+          val SourceError.userMessage: String
+              get() = when (this) {
+                  SourceError.NotFound -> "内容不存在或已下架"
+                  is SourceError.BadRequest -> "请求参数有误"
+                  SourceError.LoginRequired -> "该内容需要登录后观看"
+                  SourceError.PaymentRequired -> "该内容为付费内容，请到官方渠道观看"
+                  SourceError.DrmProtected -> "该内容受版权保护，暂不支持在本应用播放"
+                  SourceError.Expired -> "播放地址已过期，请重试"
+                  is SourceError.RateLimited -> "请求太频繁，请稍后再试"
+                  is SourceError.Network -> "网络连接失败，请检查网络"
+                  is SourceError.Server -> "服务暂时不可用（$code）"
+              }
+
+          sealed interface SourceResult<out T> {
+              data class Ok<T>(val value: T) : SourceResult<T>
+
+              data class Err(val error: SourceError) : SourceResult<Nothing>
+          }
+
+          inline fun <T, R> SourceResult<T>.map(transform: (T) -> R): SourceResult<R> = when (this) {
+              is SourceResult.Ok -> SourceResult.Ok(transform(value))
+              is SourceResult.Err -> this
+          }
+
+          fun <T> SourceResult<T>.getOrNull(): T? = (this as? SourceResult.Ok)?.value
+
+          /**
+           * 依次取完所有分页，最多 [maxPages] 页、[limit] 条。
+           * 用于搜索结果、榜单、剧集列表这类一次要展示完整内容的地方；
+           * 取到哪一页出错就把这个错误原样返回，界面据此提示并重试。
+           */
+          suspend fun <T> collectPages(
+              maxPages: Int = 20,
+              limit: Int = Int.MAX_VALUE,
+              fetch: suspend (cursor: String?) -> SourceResult<Page<T>>,
+          ): SourceResult<List<T>> {
+              val items = mutableListOf<T>()
+              var cursor: String? = null
+              var pages = 0
+              while (true) {
+                  when (val result = fetch(cursor)) {
+                      is SourceResult.Ok -> {
+                          items += result.value.items.take(limit - items.size)
+                          cursor = result.value.nextCursor
+                      }
+                      is SourceResult.Err -> return SourceResult.Err(result.error)
+                  }
+                  if (cursor == null || items.size >= limit) break
+                  pages++
+                  if (pages >= maxPages) break
+              }
+              return SourceResult.Ok(items)
+          }
+          __EOF__
+
+          f $S/data/source/MockContentSource.kt <<'__EOF__'
+          package com.shiguang.video.data.source
+
+          import com.shiguang.video.data.Drama
+          import com.shiguang.video.data.MockCatalog
+
+          /**
+           * 第一阶段的模拟片库包装成数据源：片名、简介为虚构内容，视频是 Blender 开放电影。
+           * 分页规则与真实接口一致（游标分页），用来验证界面的翻页和错误处理。
+           */
+          class MockContentSource(
+              private val pageSize: Int = 20,
+          ) : ContentSource {
+
+              override val info = SourceInfo(
+                  name = "本地模拟数据",
+                  licenseNote = "片名、简介均为虚构内容，海报由程序生成；视频为 Blender 基金会开放电影（CC BY）。",
+              )
+
+              override suspend fun catalog(query: CatalogQuery, cursor: String?): SourceResult<Page<Drama>> {
+                  val filtered = MockCatalog.dramas.filter { d ->
+                      (query.type == null || d.type == query.type) &&
+                          (query.genre == null || query.genre in d.genres)
+                  }
+                  val sorted = when (query.sort) {
+                      CatalogSort.HOT -> filtered.sortedByDescending { it.heat }
+                      CatalogSort.NEWEST -> filtered.sortedWith(compareBy<Drama> { it.updatedDaysAgo }.thenByDescending { it.heat })
+                      CatalogSort.SCORE -> filtered.sortedByDescending { it.score }
+                  }
+                  return paginate(sorted, cursor)
+              }
+
+              override suspend fun search(keyword: String, cursor: String?): SourceResult<Page<Drama>> =
+                  paginate(MockCatalog.search(keyword), cursor)
+
+              override suspend fun hotKeywords(): SourceResult<List<String>> = SourceResult.Ok(MockCatalog.hotKeywords)
+
+              override suspend fun genres(): SourceResult<List<String>> = SourceResult.Ok(MockCatalog.genres)
+
+              override suspend fun series(id: String): SourceResult<Drama> =
+                  MockCatalog.find(id)?.let { SourceResult.Ok(it) } ?: SourceResult.Err(SourceError.NotFound)
+
+              override suspend fun related(id: String, limit: Int): SourceResult<List<Drama>> =
+                  series(id).map { MockCatalog.related(it, limit) }
+
+              override suspend fun episodes(id: String, cursor: String?): SourceResult<Page<EpisodeInfo>> {
+                  val drama = MockCatalog.find(id) ?: return SourceResult.Err(SourceError.NotFound)
+                  val all = (1..drama.episodeCount).map { n ->
+                      val episode = MockCatalog.episode(drama, n)
+                      EpisodeInfo(drama.id, n, episode.title)
+                  }
+                  return paginate(all, cursor)
+              }
+
+              override suspend fun playback(id: String, episode: Int): SourceResult<Playback> {
+                  val drama = MockCatalog.find(id) ?: return SourceResult.Err(SourceError.NotFound)
+                  if (episode !in 1..drama.episodeCount) return SourceResult.Err(SourceError.NotFound)
+                  val video = MockCatalog.episode(drama, episode).video
+                  return SourceResult.Ok(
+                      Playback(
+                          dramaId = id,
+                          episode = episode,
+                          streams = listOf(VideoStream(video.url)),
+                          credit = video.credit,
+                      ),
+                  )
+              }
+
+              /** 游标就是下一页的起始位置 */
+              private fun <T> paginate(all: List<T>, cursor: String?): SourceResult<Page<T>> {
+                  val start = when (cursor) {
+                      null -> 0
+                      else -> cursor.toIntOrNull()?.takeIf { it in 0..all.size }
+                          ?: return SourceResult.Err(SourceError.BadRequest("无效的游标：$cursor"))
+                  }
+                  val end = minOf(start + pageSize, all.size)
+                  return SourceResult.Ok(Page(all.subList(start, end), end.takeIf { it < all.size }?.toString()))
+              }
+          }
+          __EOF__
+
+          f $S/data/source/PlaybackGuard.kt <<'__EOF__'
+          package com.shiguang.video.data.source
+
+          /**
+           * 播放前的检查：只挑选本应用能合法直接播放的流。
+           *
+           * 加密流、需要登录或付费的内容一律返回错误交给界面提示，不在这里尝试解密或绕过。
+           */
+          object PlaybackGuard {
+
+              fun checkAccess(episode: EpisodeInfo): SourceError? = when (episode.access) {
+                  EpisodeAccess.FREE -> null
+                  EpisodeAccess.LOGIN_REQUIRED -> SourceError.LoginRequired
+                  EpisodeAccess.PAID -> SourceError.PaymentRequired
+              }
+
+              /** 选出不超过 [maxHeight] 的最高清晰度未加密流；高度未知的流排在最后作为兜底 */
+              fun selectStream(
+                  playback: Playback,
+                  nowMillis: Long,
+                  maxHeight: Int = 1080,
+              ): SourceResult<VideoStream> {
+                  val expiresAt = playback.expiresAtMillis
+                  if (expiresAt != null && nowMillis >= expiresAt) return SourceResult.Err(SourceError.Expired)
+
+                  val open = playback.streams.filterNot { it.protected }
+                  if (open.isEmpty()) {
+                      val error = if (playback.streams.isEmpty()) SourceError.NotFound else SourceError.DrmProtected
+                      return SourceResult.Err(error)
+                  }
+
+                  val best = open.filter { it.height != null && it.height <= maxHeight }.maxByOrNull { it.height!! }
+                      ?: open.firstOrNull { it.height == null }
+                      ?: open.minBy { it.height!! }
+                  return SourceResult.Ok(best)
+              }
+          }
+          __EOF__
+
+          f app/src/test/java/com/shiguang/video/data/source/ContentSourceContract.kt <<'__EOF__'
+          package com.shiguang.video.data.source
+
+          import kotlinx.coroutines.runBlocking
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertFalse
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          /**
+           * 所有数据源都要通过的约定测试。接入新数据源时继承这个类，换成新的 [createSource] 即可。
+           * 真实接口的测试应改用录制好的响应，不要在单元测试里请求线上服务。
+           */
+          abstract class ContentSourceContract {
+
+              abstract fun createSource(): ContentSource
+
+              private val source by lazy { createSource() }
+
+              private fun <T> SourceResult<T>.ok(): T = when (this) {
+                  is SourceResult.Ok -> value
+                  is SourceResult.Err -> throw AssertionError("期望成功，实际返回 $error")
+              }
+
+              private suspend fun allCatalog(query: CatalogQuery = CatalogQuery()) = buildList {
+                  var cursor: String? = null
+                  do {
+                      val page = source.catalog(query, cursor).ok()
+                      addAll(page.items)
+                      cursor = page.nextCursor
+                  } while (cursor != null)
+              }
+
+              @Test
+              fun pagingCoversEverythingWithoutDuplicates() = runBlocking<Unit> {
+                  val ids = allCatalog().map { it.id }
+                  assertTrue(ids.isNotEmpty())
+                  assertEquals(ids.size, ids.toSet().size)
+              }
+
+              @Test
+              fun catalogHonoursFilterAndSort() = runBlocking<Unit> {
+                  val first = allCatalog().first()
+                  val byType = allCatalog(CatalogQuery(type = first.type))
+                  assertTrue(byType.all { it.type == first.type })
+
+                  val genre = first.genres.first()
+                  assertTrue(allCatalog(CatalogQuery(genre = genre)).all { genre in it.genres })
+
+                  val heats = allCatalog(CatalogQuery(sort = CatalogSort.HOT)).map { it.heat }
+                  assertEquals(heats.sortedDescending(), heats)
+              }
+
+              @Test
+              fun invalidCursorIsRejected() = runBlocking<Unit> {
+                  val result = source.catalog(CatalogQuery(), "not-a-cursor")
+                  assertTrue(result is SourceResult.Err && result.error is SourceError.BadRequest)
+              }
+
+              @Test
+              fun blankSearchReturnsNothing() = runBlocking<Unit> {
+                  assertTrue(source.search("   ").ok().items.isEmpty())
+              }
+
+              @Test
+              fun searchFindsByTitle() = runBlocking<Unit> {
+                  val drama = allCatalog().first()
+                  assertTrue(source.search(drama.title).ok().items.any { it.id == drama.id })
+              }
+
+              @Test
+              fun unknownSeriesIsNotFound() = runBlocking<Unit> {
+                  assertEquals(SourceResult.Err(SourceError.NotFound), source.series("no-such-id"))
+                  assertEquals(SourceResult.Err(SourceError.NotFound), source.playback("no-such-id", 1))
+              }
+
+              @Test
+              fun episodesAreNumberedFromOne() = runBlocking<Unit> {
+                  val drama = allCatalog().first()
+                  val numbers = buildList {
+                      var cursor: String? = null
+                      do {
+                          val page = source.episodes(drama.id, cursor).ok()
+                          addAll(page.items.map { it.number })
+                          cursor = page.nextCursor
+                      } while (cursor != null)
+                  }
+                  assertEquals((1..drama.episodeCount).toList(), numbers)
+              }
+
+              @Test
+              fun relatedExcludesItself() = runBlocking<Unit> {
+                  val drama = allCatalog().first()
+                  val related = source.related(drama.id, limit = 5).ok()
+                  assertTrue(related.size <= 5)
+                  assertFalse(related.any { it.id == drama.id })
+              }
+
+              @Test
+              fun firstEpisodeHasPlayableStream() = runBlocking<Unit> {
+                  val drama = allCatalog().first()
+                  val playback = source.playback(drama.id, 1).ok()
+                  assertEquals(drama.id, playback.dramaId)
+                  val stream = PlaybackGuard.selectStream(playback, nowMillis = System.currentTimeMillis()).ok()
+                  assertTrue(stream.url.startsWith("https://"))
+              }
+
+              @Test
+              fun outOfRangeEpisodeIsNotFound() = runBlocking<Unit> {
+                  val drama = allCatalog().first()
+                  assertEquals(SourceResult.Err(SourceError.NotFound), source.playback(drama.id, drama.episodeCount + 1))
+              }
+
+              @Test
+              fun sourceDescribesItsLicense() {
+                  assertTrue(source.info.name.isNotBlank())
+                  assertTrue(source.info.licenseNote.isNotBlank())
+              }
+          }
+
+          class MockContentSourceTest : ContentSourceContract() {
+              // 每页 5 条，确保翻页逻辑被覆盖到
+              override fun createSource(): ContentSource = MockContentSource(pageSize = 5)
+
+              @Test
+              fun mockPlaybackCarriesCredit() = runBlocking<Unit> {
+                  val playback = createSource().playback("d01", 1)
+                  assertTrue(playback is SourceResult.Ok && !playback.value.credit.isNullOrBlank())
+              }
+          }
+          __EOF__
+
+          f app/src/test/java/com/shiguang/video/data/source/PlaybackGuardTest.kt <<'__EOF__'
+          package com.shiguang.video.data.source
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertNull
+          import org.junit.Test
+
+          class PlaybackGuardTest {
+
+              private fun playback(vararg streams: VideoStream, expiresAt: Long? = null) =
+                  Playback("d01", 1, streams.toList(), expiresAtMillis = expiresAt)
+
+              @Test
+              fun picksHighestStreamWithinLimit() {
+                  val result = PlaybackGuard.selectStream(
+                      playback(VideoStream("a", 480), VideoStream("b", 1080), VideoStream("c", 2160)),
+                      nowMillis = 0,
+                  )
+                  assertEquals(SourceResult.Ok(VideoStream("b", 1080)), result)
+              }
+
+              @Test
+              fun fallsBackToUnknownThenLowest() {
+                  assertEquals(
+                      SourceResult.Ok(VideoStream("u")),
+                      PlaybackGuard.selectStream(playback(VideoStream("c", 2160), VideoStream("u")), nowMillis = 0),
+                  )
+                  assertEquals(
+                      SourceResult.Ok(VideoStream("c", 1440)),
+                      PlaybackGuard.selectStream(playback(VideoStream("d", 2160), VideoStream("c", 1440)), nowMillis = 0),
+                  )
+              }
+
+              @Test
+              fun protectedStreamsAreNeverSelected() {
+                  val mixed = playback(VideoStream("enc", 1080, protected = true), VideoStream("open", 720))
+                  assertEquals(SourceResult.Ok(VideoStream("open", 720)), PlaybackGuard.selectStream(mixed, nowMillis = 0))
+
+                  val onlyProtected = playback(VideoStream("enc", 1080, protected = true))
+                  assertEquals(SourceResult.Err(SourceError.DrmProtected), PlaybackGuard.selectStream(onlyProtected, nowMillis = 0))
+              }
+
+              @Test
+              fun expiredOrEmptyPlaybackIsRejected() {
+                  assertEquals(
+                      SourceResult.Err(SourceError.Expired),
+                      PlaybackGuard.selectStream(playback(VideoStream("a", 720), expiresAt = 1_000), nowMillis = 1_000),
+                  )
+                  assertEquals(SourceResult.Err(SourceError.NotFound), PlaybackGuard.selectStream(playback(), nowMillis = 0))
+              }
+
+              @Test
+              fun loginAndPaidEpisodesAreBlocked() {
+                  assertNull(PlaybackGuard.checkAccess(EpisodeInfo("d01", 1, "第1集")))
+                  assertEquals(SourceError.LoginRequired, PlaybackGuard.checkAccess(EpisodeInfo("d01", 2, "第2集", EpisodeAccess.LOGIN_REQUIRED)))
+                  assertEquals(SourceError.PaymentRequired, PlaybackGuard.checkAccess(EpisodeInfo("d01", 3, "第3集", EpisodeAccess.PAID)))
+              }
+          }
+          __EOF__
+
+          f app/src/test/java/com/shiguang/video/data/source/CollectPagesTest.kt <<'__EOF__'
+          package com.shiguang.video.data.source
+
+          import kotlinx.coroutines.runBlocking
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class CollectPagesTest {
+
+              private fun <T> ok(items: List<T>, next: String?) = SourceResult.Ok(Page(items, next))
+
+              @Test
+              fun walksEveryPageUntilExhausted() = runBlocking<Unit> {
+                  val pages = listOf(ok(listOf(1, 2), "c1"), ok(listOf(3, 4), "c2"), ok(listOf(5), null))
+                  val result = collectPages { cursor ->
+                      when (cursor) {
+                          null -> pages[0]
+                          "c1" -> pages[1]
+                          "c2" -> pages[2]
+                          else -> SourceResult.Err(SourceError.BadRequest("bad cursor"))
+                      }
+                  }
+                  assertEquals(SourceResult.Ok(listOf(1, 2, 3, 4, 5)), result)
+              }
+
+              @Test
+              fun stopsAtLimit() = runBlocking<Unit> {
+                  val result = collectPages(limit = 3) { cursor ->
+                      when (cursor) {
+                          null -> ok(listOf(1, 2), "c1")
+                          else -> ok(listOf(3, 4), "c2")
+                      }
+                  }
+                  assertEquals(SourceResult.Ok(listOf(1, 2, 3)), result)
+              }
+
+              @Test
+              fun stopsAtMaxPages() = runBlocking<Unit> {
+                  var calls = 0
+                  val result = collectPages(maxPages = 2) { _ ->
+                      calls++
+                      ok(listOf(calls), "c$calls")
+                  }
+                  // 最多取 2 页：第一页 + 一次翻页
+                  assertEquals(2, calls)
+                  assertTrue(result is SourceResult.Ok)
+              }
+
+              @Test
+              fun propagatesPageError() = runBlocking<Unit> {
+                  val result = collectPages { cursor ->
+                      if (cursor == null) ok(listOf(1), "c1") else SourceResult.Err(SourceError.Network())
+                  }
+                  assertTrue(result is SourceResult.Err && result.error is SourceError.Network)
+              }
+          }
+          __EOF__
+
       - name: Generate storage, app entry and theme
         run: |
           f() { mkdir -p "$(dirname "$1")"; cat > "$1"; }
@@ -724,6 +1280,8 @@ jobs:
           import android.content.ContextWrapper
           import com.shiguang.video.data.SearchHistoryRepository
           import com.shiguang.video.data.WatchProgressRepository
+          import com.shiguang.video.data.source.ContentSource
+          import com.shiguang.video.data.source.MockContentSource
 
           class ShiguangApp : Application() {
               lateinit var progressRepo: WatchProgressRepository
@@ -731,10 +1289,18 @@ jobs:
               lateinit var searchHistory: SearchHistoryRepository
                   private set
 
+              /**
+               * 片库数据源。界面只通过 [ContentSource] 接口取数据，
+               * 接真实接口时在这里换一个实现即可，界面代码不用改。
+               */
+              lateinit var contentSource: ContentSource
+                  private set
+
               override fun onCreate() {
                   super.onCreate()
                   progressRepo = WatchProgressRepository(this)
                   searchHistory = SearchHistoryRepository(this)
+                  contentSource = MockContentSource()
               }
           }
 
@@ -876,8 +1442,10 @@ jobs:
           f $S/ui/components/Poster.kt <<'__EOF__'
           package com.shiguang.video.ui.components
 
+          import androidx.compose.foundation.Image
           import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.fillMaxSize
           import androidx.compose.foundation.layout.fillMaxWidth
           import androidx.compose.foundation.layout.padding
           import androidx.compose.foundation.shape.RoundedCornerShape
@@ -891,6 +1459,7 @@ jobs:
           import androidx.compose.ui.graphics.Brush
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.Shadow
+          import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.drawText
           import androidx.compose.ui.text.font.FontWeight
@@ -901,6 +1470,8 @@ jobs:
           import androidx.compose.ui.unit.Dp
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import coil.compose.AsyncImagePainter
+          import coil.compose.rememberAsyncImagePainter
           import com.shiguang.video.data.Drama
           import com.shiguang.video.ui.theme.AppColors
 
@@ -918,9 +1489,8 @@ jobs:
           )
 
           /**
-           * 程序生成的占位海报：渐变底色 + 几何纹理 + 片名水印。
-           * 底图和文字都在一次绘制里完成，只在尺寸或内容变化时重新排版，列表滚动时开销很小。
-           * 后续接入真实素材时，把这里替换成网络图片加载即可。
+           * 剧集海报：数据源给了 [Drama.coverUrl] 就加载网络封面，
+           * 没有链接、还在加载或者加载失败时，显示下面程序生成的占位海报。
            */
           @Composable
           fun Poster(
@@ -931,84 +1501,10 @@ jobs:
               badge: String? = null,
               progress: Float? = null,
           ) {
-              val colors = PosterPalettes[drama.posterSeed.mod(PosterPalettes.size)]
-              val variant = drama.posterSeed % 3
-              val textMeasurer = rememberTextMeasurer()
-              Box(
-                  modifier
-                      .clip(RoundedCornerShape(corner))
-                      .drawWithCache {
-                          val w = size.width
-                          val h = size.height
-                          val r = size.minDimension
-                          val widthDp = w.toDp().value
-                          val background = Brush.linearGradient(colors)
-                          val shade = Brush.verticalGradient(
-                              listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f)),
-                              startY = h * 0.45f,
-                              endY = h,
-                          )
-                          val mark = textMeasurer.measure(
-                              drama.title.take(1),
-                              TextStyle(
-                                  color = Color.White.copy(alpha = 0.16f),
-                                  fontSize = (widthDp * 0.62f).sp,
-                                  fontWeight = FontWeight.Black,
-                              ),
-                          )
-                          val sidePadding = 8.dp.toPx()
-                          val title = if (showTitle) {
-                              textMeasurer.measure(
-                                  drama.title,
-                                  TextStyle(
-                                      color = Color.White,
-                                      fontSize = widthDp.times(0.12f).coerceIn(11f, 28f).sp,
-                                      lineHeight = widthDp.times(0.15f).coerceIn(14f, 34f).sp,
-                                      fontWeight = FontWeight.ExtraBold,
-                                      textAlign = TextAlign.Center,
-                                  ),
-                                  overflow = TextOverflow.Ellipsis,
-                                  maxLines = 2,
-                                  constraints = Constraints.fixedWidth((w - sidePadding * 2).toInt().coerceAtLeast(0)),
-                              )
-                          } else {
-                              null
-                          }
-                          val titleShadow = Shadow(Color.Black.copy(alpha = 0.6f), Offset(0f, 2f), 6f)
+              Box(modifier.clip(RoundedCornerShape(corner))) {
+                  GeneratedPoster(drama, showTitle, Modifier.fillMaxSize())
+                  CoverImage(drama.coverUrl, Modifier.fillMaxSize())
 
-                          onDrawBehind {
-                              drawRect(background)
-                              when (variant) {
-                                  0 -> {
-                                      drawCircle(Color.White.copy(alpha = 0.12f), r * 0.55f, Offset(w * 0.85f, h * 0.18f))
-                                      drawCircle(Color.White.copy(alpha = 0.06f), r * 0.85f, Offset(w * 0.05f, h * 0.7f))
-                                  }
-                                  1 -> {
-                                      drawCircle(Color.White.copy(alpha = 0.10f), r * 0.35f, Offset(w * 0.5f, h * 0.32f))
-                                      drawCircle(Color.White.copy(alpha = 0.05f), r * 0.6f, Offset(w * 0.5f, h * 0.32f))
-                                  }
-                                  else -> {
-                                      for (i in 0..5) {
-                                          val y = h * (0.1f + i * 0.09f)
-                                          drawLine(Color.White.copy(alpha = 0.07f), Offset(0f, y + w * 0.3f), Offset(w, y), strokeWidth = r * 0.03f)
-                                      }
-                                  }
-                              }
-                              drawRect(shade)
-                              drawText(
-                                  mark,
-                                  topLeft = Offset((w - mark.size.width) / 2f, (h - mark.size.height) / 2f - h * 0.1f),
-                              )
-                              if (title != null) {
-                                  drawText(
-                                      title,
-                                      topLeft = Offset(sidePadding, h - w * 0.08f - title.size.height),
-                                      shadow = titleShadow,
-                                  )
-                              }
-                          }
-                      },
-              ) {
                   if (badge != null) {
                       Text(
                           text = badge,
@@ -1040,6 +1536,105 @@ jobs:
                       ProgressStrip(progress, Modifier.align(Alignment.BottomCenter).fillMaxWidth())
                   }
               }
+          }
+
+          /** 只在图片真正加载成功后覆盖上去，失败时下面的占位海报照常显示 */
+          @Composable
+          private fun CoverImage(url: String?, modifier: Modifier = Modifier) {
+              if (url.isNullOrBlank()) return
+              val painter = rememberAsyncImagePainter(model = url)
+              if (painter.state is AsyncImagePainter.State.Success) {
+                  Image(
+                      painter = painter,
+                      contentDescription = null,
+                      contentScale = ContentScale.Crop,
+                      modifier = modifier,
+                  )
+              }
+          }
+
+          /**
+           * 程序生成的占位海报：渐变底色 + 几何纹理 + 片名水印。
+           * 底图和文字都在一次绘制里完成，只在尺寸或内容变化时重新排版，列表滚动时开销很小。
+           */
+          @Composable
+          private fun GeneratedPoster(drama: Drama, showTitle: Boolean, modifier: Modifier = Modifier) {
+              val colors = PosterPalettes[drama.posterSeed.mod(PosterPalettes.size)]
+              val variant = drama.posterSeed % 3
+              val textMeasurer = rememberTextMeasurer()
+              Box(
+                  modifier.drawWithCache {
+                      val w = size.width
+                      val h = size.height
+                      val r = size.minDimension
+                      val widthDp = w.toDp().value
+                      val background = Brush.linearGradient(colors)
+                      val shade = Brush.verticalGradient(
+                          listOf(Color.Transparent, Color.Black.copy(alpha = 0.7f)),
+                          startY = h * 0.45f,
+                          endY = h,
+                      )
+                      val mark = textMeasurer.measure(
+                          drama.title.take(1),
+                          TextStyle(
+                              color = Color.White.copy(alpha = 0.16f),
+                              fontSize = (widthDp * 0.62f).sp,
+                              fontWeight = FontWeight.Black,
+                          ),
+                      )
+                      val sidePadding = 8.dp.toPx()
+                      val title = if (showTitle) {
+                          textMeasurer.measure(
+                              drama.title,
+                              TextStyle(
+                                  color = Color.White,
+                                  fontSize = widthDp.times(0.12f).coerceIn(11f, 28f).sp,
+                                  lineHeight = widthDp.times(0.15f).coerceIn(14f, 34f).sp,
+                                  fontWeight = FontWeight.ExtraBold,
+                                  textAlign = TextAlign.Center,
+                              ),
+                              overflow = TextOverflow.Ellipsis,
+                              maxLines = 2,
+                              constraints = Constraints.fixedWidth((w - sidePadding * 2).toInt().coerceAtLeast(0)),
+                          )
+                      } else {
+                          null
+                      }
+                      val titleShadow = Shadow(Color.Black.copy(alpha = 0.6f), Offset(0f, 2f), 6f)
+
+                      onDrawBehind {
+                          drawRect(background)
+                          when (variant) {
+                              0 -> {
+                                  drawCircle(Color.White.copy(alpha = 0.12f), r * 0.55f, Offset(w * 0.85f, h * 0.18f))
+                                  drawCircle(Color.White.copy(alpha = 0.06f), r * 0.85f, Offset(w * 0.05f, h * 0.7f))
+                              }
+                              1 -> {
+                                  drawCircle(Color.White.copy(alpha = 0.10f), r * 0.35f, Offset(w * 0.5f, h * 0.32f))
+                                  drawCircle(Color.White.copy(alpha = 0.05f), r * 0.6f, Offset(w * 0.5f, h * 0.32f))
+                              }
+                              else -> {
+                                  for (i in 0..5) {
+                                      val y = h * (0.1f + i * 0.09f)
+                                      drawLine(Color.White.copy(alpha = 0.07f), Offset(0f, y + w * 0.3f), Offset(w, y), strokeWidth = r * 0.03f)
+                                  }
+                              }
+                          }
+                          drawRect(shade)
+                          drawText(
+                              mark,
+                              topLeft = Offset((w - mark.size.width) / 2f, (h - mark.size.height) / 2f - h * 0.1f),
+                          )
+                          if (title != null) {
+                              drawText(
+                                  title,
+                                  topLeft = Offset(sidePadding, h - w * 0.08f - title.size.height),
+                                  shadow = titleShadow,
+                              )
+                          }
+                      }
+                  },
+              )
           }
           __EOF__
 
@@ -1242,21 +1837,263 @@ jobs:
           }
           __EOF__
 
+          f $S/ui/components/SourceState.kt <<'__EOF__'
+          package com.shiguang.video.ui.components
+
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.Stable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.shiguang.video.app
+          import com.shiguang.video.data.source.ContentSource
+          import com.shiguang.video.data.source.Page
+          import com.shiguang.video.data.source.SourceError
+          import com.shiguang.video.data.source.SourceResult
+          import com.shiguang.video.data.source.retryable
+          import com.shiguang.video.data.source.userMessage
+          import com.shiguang.video.ui.theme.AppColors
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.launch
+
+          /** 界面取得的数据源。界面只认这个接口，不认识具体实现 */
+          @Composable
+          fun rememberContentSource(): ContentSource {
+              val context = LocalContext.current
+              return remember(context) { context.app.contentSource }
+          }
+
+          /** 界面从数据源取数据时的三种状态 */
+          sealed interface SourceState<out T> {
+              data object Loading : SourceState<Nothing>
+
+              data class Ready<T>(val value: T) : SourceState<T>
+
+              data class Failed(val error: SourceError) : SourceState<Nothing>
+          }
+
+          private fun <T> SourceResult<T>.toState(): SourceState<T> = when (this) {
+              is SourceResult.Ok -> SourceState.Ready(value)
+              is SourceResult.Err -> SourceState.Failed(error)
+          }
+
+          /** 承载一次数据源请求，[retry] 让界面重新请求 */
+          @Stable
+          class SourceStateHolder<T> {
+              var state by mutableStateOf<SourceState<T>>(SourceState.Loading)
+                  internal set
+
+              internal var attempt by mutableIntStateOf(0)
+
+              fun retry() {
+                  attempt++
+              }
+          }
+
+          /** 请求一次数据。key 变化时重新请求；出错时可通过 [SourceStateHolder.retry] 重试。 */
+          @Composable
+          fun <T> rememberSourceState(
+              vararg keys: Any?,
+              load: suspend () -> SourceResult<T>,
+          ): SourceStateHolder<T> {
+              val holder = remember(*keys) { SourceStateHolder<T>() }
+              LaunchedEffect(holder, holder.attempt) {
+                  holder.state = SourceState.Loading
+                  holder.state = load().toState()
+              }
+              return holder
+          }
+
+          /**
+           * 游标分页列表：首屏加载、滚到底部加载下一页、出错重试。
+           * 界面只接触 [items]，不知道数据来自哪个实现。
+           */
+          @Stable
+          class PagerStateHolder<T>(
+              private val scope: CoroutineScope,
+              private val fetch: suspend (cursor: String?) -> SourceResult<Page<T>>,
+          ) {
+              var items by mutableStateOf<List<T>>(emptyList())
+                  private set
+
+              var loading by mutableStateOf(false)
+                  private set
+
+              var error by mutableStateOf<SourceError?>(null)
+                  private set
+
+              var exhausted by mutableStateOf(false)
+                  private set
+
+              private var cursor: String? = null
+              private var job: Job? = null
+
+              val hasMore: Boolean get() = !exhausted
+
+              /** 换筛选条件时调用：清空并重新加载第一页 */
+              fun reload() {
+                  items = emptyList()
+                  cursor = null
+                  exhausted = false
+                  error = null
+                  job?.cancel()
+                  job = scope.launch { fetchPage() }
+              }
+
+              /** 加载下一页；正在加载或已经到底时不重复请求 */
+              fun loadMore() {
+                  if (job?.isActive == true || exhausted) return
+                  job = scope.launch { fetchPage() }
+              }
+
+              fun retry() {
+                  error = null
+                  loadMore()
+              }
+
+              private suspend fun fetchPage() {
+                  loading = true
+                  error = null
+                  when (val result = fetch(cursor)) {
+                      is SourceResult.Ok -> {
+                          items = items + result.value.items
+                          cursor = result.value.nextCursor
+                          exhausted = cursor == null
+                      }
+                      is SourceResult.Err -> error = result.error
+                  }
+                  loading = false
+              }
+          }
+
+          @Composable
+          fun <T> rememberPager(
+              vararg keys: Any?,
+              fetch: suspend (cursor: String?) -> SourceResult<Page<T>>,
+          ): PagerStateHolder<T> {
+              val scope = rememberCoroutineScope()
+              val holder = remember(*keys) { PagerStateHolder(scope, fetch) }
+              LaunchedEffect(holder) { holder.reload() }
+              return holder
+          }
+
+          /** 列表底部的翻页提示：滚到这里就自动取下一页，出错时可重试 */
+          @Composable
+          fun PagerFooter(pager: PagerStateHolder<*>, modifier: Modifier = Modifier) {
+              val error = pager.error
+              Box(
+                  modifier
+                      .fillMaxWidth()
+                      .padding(vertical = 16.dp),
+                  contentAlignment = Alignment.Center,
+              ) {
+                  when {
+                      error != null -> SourceErrorState(
+                          error = error,
+                          onRetry = pager::retry,
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .padding(8.dp),
+                      )
+
+                      pager.hasMore -> {
+                          // 这个条目被组合出来，说明用户已经滚到列表底部
+                          LaunchedEffect(pager.items.size) { pager.loadMore() }
+                          CircularProgressIndicator(
+                              color = AppColors.Accent,
+                              strokeWidth = 2.dp,
+                              modifier = Modifier.size(22.dp),
+                          )
+                      }
+
+                      pager.items.isNotEmpty() -> Text("没有更多了", color = AppColors.TextSecondary, fontSize = 12.sp)
+                  }
+              }
+          }
+
+          @Composable
+          fun SourceLoading(modifier: Modifier = Modifier.fillMaxSize()) {
+              Box(modifier, contentAlignment = Alignment.Center) {
+                  CircularProgressIndicator(
+                      color = AppColors.Accent,
+                      strokeWidth = 2.dp,
+                      modifier = Modifier.size(28.dp),
+                  )
+              }
+          }
+
+          /** 出错提示。只有请求本身值得重试（网络、频率限制）时才给出重试按钮 */
+          @Composable
+          fun SourceErrorState(
+              error: SourceError,
+              onRetry: () -> Unit,
+              modifier: Modifier = Modifier.fillMaxSize(),
+          ) {
+              Column(
+                  modifier.padding(40.dp),
+                  verticalArrangement = Arrangement.Center,
+                  horizontalAlignment = Alignment.CenterHorizontally,
+              ) {
+                  Text(error.userMessage, color = AppColors.TextSecondary, fontSize = 14.sp, textAlign = TextAlign.Center)
+                  if (error.retryable) {
+                      Spacer(Modifier.height(12.dp))
+                      Text(
+                          text = "重试",
+                          color = AppColors.Accent,
+                          fontSize = 14.sp,
+                          modifier = Modifier
+                              .clip(RoundedCornerShape(50))
+                              .clickable(onClick = onRetry)
+                              .padding(horizontal = 18.dp, vertical = 8.dp),
+                      )
+                  }
+              }
+          }
+          __EOF__
+
           f $S/ui/components/History.kt <<'__EOF__'
           package com.shiguang.video.ui.components
 
           import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
           import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
           import androidx.compose.ui.platform.LocalContext
           import androidx.lifecycle.compose.collectAsStateWithLifecycle
           import com.shiguang.video.app
           import com.shiguang.video.data.ContentType
           import com.shiguang.video.data.Drama
           import com.shiguang.video.data.DramaProgress
-          import com.shiguang.video.data.MockCatalog
           import com.shiguang.video.data.ProgressPolicy
           import com.shiguang.video.data.WatchProgressRepository
+          import com.shiguang.video.data.source.SourceResult
 
           data class HistoryItem(val drama: Drama, val progress: DramaProgress) {
               /** 点击“继续观看”时进入的集数 */
@@ -1279,15 +2116,33 @@ jobs:
               return remember(context) { context.app.progressRepo }
           }
 
-          /** 按最近观看时间倒序的观看记录 */
+          /**
+           * 按最近观看时间倒序的观看记录。
+           * 记录里只存了剧集编号，剧集信息向数据源查询；查不到的（已下架）直接跳过。
+           */
           @Composable
           fun rememberWatchHistory(): List<HistoryItem> {
+              val context = LocalContext.current
+              val source = remember(context) { context.app.contentSource }
               val repo = rememberProgressRepo()
               val all by repo.all.collectAsStateWithLifecycle()
-              return remember(all) {
+
+              // 剧集信息只在“看过的剧有增减”时重新取，播放进度每 5 秒的变化不会触发请求
+              val ids = remember(all) { all.keys.sorted() }
+              var dramas by remember(ids) { mutableStateOf<Map<String, Drama>>(emptyMap()) }
+              LaunchedEffect(ids) {
+                  val loaded = mutableMapOf<String, Drama>()
+                  ids.forEach { id ->
+                      val result = source.series(id)
+                      if (result is SourceResult.Ok) loaded[id] = result.value
+                  }
+                  dramas = loaded
+              }
+
+              return remember(all, dramas) {
                   all.values
                       .sortedByDescending { it.updatedAt }
-                      .mapNotNull { p -> MockCatalog.find(p.dramaId)?.let { HistoryItem(it, p) } }
+                      .mapNotNull { p -> dramas[p.dramaId]?.let { HistoryItem(it, p) } }
               }
           }
           __EOF__
@@ -1380,11 +2235,11 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
-          import androidx.compose.foundation.layout.Arrangement
           import androidx.compose.foundation.layout.Box
           import androidx.compose.foundation.layout.Column
           import androidx.compose.foundation.layout.Row
           import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.Arrangement
           import androidx.compose.foundation.layout.fillMaxHeight
           import androidx.compose.foundation.layout.fillMaxSize
           import androidx.compose.foundation.layout.fillMaxWidth
@@ -1571,12 +2426,19 @@ jobs:
           import androidx.compose.ui.unit.sp
           import com.shiguang.video.data.ContentType
           import com.shiguang.video.data.Drama
-          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.source.CatalogQuery
+          import com.shiguang.video.data.source.CatalogSort
+          import com.shiguang.video.data.source.collectPages
           import com.shiguang.video.ui.components.DramaCard
           import com.shiguang.video.ui.components.Pill
           import com.shiguang.video.ui.components.RoundIconButton
           import com.shiguang.video.ui.components.SectionHeader
+          import com.shiguang.video.ui.components.SourceErrorState
+          import com.shiguang.video.ui.components.SourceLoading
+          import com.shiguang.video.ui.components.SourceState
           import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberContentSource
+          import com.shiguang.video.ui.components.rememberSourceState
           import com.shiguang.video.ui.components.rememberWatchHistory
           import com.shiguang.video.ui.theme.AppColors
 
@@ -1593,12 +2455,20 @@ jobs:
               var type by rememberSaveable { mutableStateOf<ContentType?>(null) }
               val history = rememberWatchHistory().filter { type == null || it.drama.type == type }
 
-              val source = remember(type) { MockCatalog.dramas.filter { type == null || it.type == type } }
-              val recent = remember(source) { source.sortedBy { it.updatedDaysAgo }.take(10) }
-              val recommended = remember(source) {
-                  // 模拟“每日更新”的推荐顺序：评分为主，按日期轻微打散
+              val source = rememberContentSource()
+              val holder = rememberSourceState(type) {
+                  collectPages { cursor ->
+                      source.catalog(CatalogQuery(type = type, sort = CatalogSort.NEWEST), cursor)
+                  }
+              }
+              val state = holder.state
+              val all = (state as? SourceState.Ready)?.value.orEmpty()
+
+              val recent = remember(all) { all.take(10) }
+              val recommended = remember(all) {
+                  // “每日更新”的推荐顺序：评分为主，按日期轻微打散
                   val day = (System.currentTimeMillis() / 86_400_000L).toInt()
-                  source.sortedByDescending { it.score * 10 + (it.posterSeed + day) % 5 }
+                  all.sortedByDescending { it.score * 10 + (it.id.hashCode() + day).mod(5) }
               }
 
               LazyColumn(
@@ -1653,35 +2523,57 @@ jobs:
                       }
                   }
 
-                  item {
-                      SectionHeader(
-                          title = "最近更新",
-                          extra = "共 ${source.size} 部",
-                          action = "查看全部",
-                          onAction = { onSeeAllRecent(type) },
-                          modifier = Modifier.padding(top = 6.dp),
-                      )
-                  }
-                  item {
-                      LazyRow(
-                          contentPadding = PaddingValues(horizontal = 20.dp),
-                          horizontalArrangement = Arrangement.spacedBy(12.dp),
-                      ) {
-                          items(recent, key = { it.id }) { d ->
-                              DramaCard(
-                                  drama = d,
-                                  subtitle = d.heatText,
-                                  badge = if (d.updatedDaysAgo <= 1) "新上线" else null,
-                                  onClick = { onOpenDrama(d.id) },
-                                  modifier = Modifier.width(RowCardWidth),
+                  when (state) {
+                      is SourceState.Loading -> item {
+                          SourceLoading(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .height(180.dp),
+                          )
+                      }
+
+                      is SourceState.Failed -> item {
+                          SourceErrorState(
+                              error = state.error,
+                              onRetry = holder::retry,
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .height(220.dp),
+                          )
+                      }
+
+                      is SourceState.Ready -> {
+                          item {
+                              SectionHeader(
+                                  title = "最近更新",
+                                  extra = "共 ${all.size} 部",
+                                  action = "查看全部",
+                                  onAction = { onSeeAllRecent(type) },
+                                  modifier = Modifier.padding(top = 6.dp),
                               )
                           }
-                      }
-                  }
+                          item {
+                              LazyRow(
+                                  contentPadding = PaddingValues(horizontal = 20.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(12.dp),
+                              ) {
+                                  items(recent, key = { it.id }) { d ->
+                                      DramaCard(
+                                          drama = d,
+                                          subtitle = d.heatText,
+                                          badge = if (d.updatedDaysAgo <= 1) "新上线" else null,
+                                          onClick = { onOpenDrama(d.id) },
+                                          modifier = Modifier.width(RowCardWidth),
+                                      )
+                                  }
+                              }
+                          }
 
-                  item { SectionHeader("为你推荐", extra = "每日更新", modifier = Modifier.padding(top = 6.dp)) }
-                  items(recommended.chunked(2)) { pair ->
-                      RecommendRow(pair, onOpenDrama)
+                          item { SectionHeader("为你推荐", extra = "每日更新", modifier = Modifier.padding(top = 6.dp)) }
+                          items(recommended.chunked(2)) { pair ->
+                              RecommendRow(pair, onOpenDrama)
+                          }
+                      }
                   }
               }
           }
@@ -1728,19 +2620,25 @@ jobs:
           import androidx.compose.foundation.lazy.items
           import androidx.compose.material3.Text
           import androidx.compose.runtime.Composable
-          import androidx.compose.runtime.remember
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import com.shiguang.video.data.ContentType
-          import com.shiguang.video.data.Drama
-          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.source.CatalogQuery
+          import com.shiguang.video.data.source.CatalogSort
           import com.shiguang.video.ui.components.DramaCard
           import com.shiguang.video.ui.components.EmptyState
+          import com.shiguang.video.ui.components.PagerFooter
           import com.shiguang.video.ui.components.Pill
+          import com.shiguang.video.ui.components.SourceErrorState
+          import com.shiguang.video.ui.components.SourceLoading
+          import com.shiguang.video.ui.components.SourceState
           import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberContentSource
+          import com.shiguang.video.ui.components.rememberPager
+          import com.shiguang.video.ui.components.rememberSourceState
           import com.shiguang.video.ui.theme.AppColors
 
           enum class SortOrder(val label: String) {
@@ -1749,23 +2647,17 @@ jobs:
               SCORE("好评"),
           }
 
+          fun SortOrder.toCatalogSort(): CatalogSort = when (this) {
+              SortOrder.HOT -> CatalogSort.HOT
+              SortOrder.NEWEST -> CatalogSort.NEWEST
+              SortOrder.SCORE -> CatalogSort.SCORE
+          }
+
           data class CategoryFilter(
               val type: ContentType? = null,
               val genre: String? = null,
               val sort: SortOrder = SortOrder.HOT,
           )
-
-          fun applyFilter(dramas: List<Drama>, filter: CategoryFilter): List<Drama> {
-              val filtered = dramas.filter { d ->
-                  (filter.type == null || d.type == filter.type) &&
-                      (filter.genre == null || filter.genre in d.genres)
-              }
-              return when (filter.sort) {
-                  SortOrder.HOT -> filtered.sortedByDescending { it.heat }
-                  SortOrder.NEWEST -> filtered.sortedBy { it.updatedDaysAgo }
-                  SortOrder.SCORE -> filtered.sortedByDescending { it.score }
-              }
-          }
 
           @Composable
           fun CategoryScreen(
@@ -1773,7 +2665,18 @@ jobs:
               onFilterChange: (CategoryFilter) -> Unit,
               onOpenDrama: (String) -> Unit,
           ) {
-              val results = remember(filter) { applyFilter(MockCatalog.dramas, filter) }
+              val source = rememberContentSource()
+              val genreState = rememberSourceState { source.genres() }
+              val genres = (genreState.state as? SourceState.Ready)?.value.orEmpty()
+
+              val query = CatalogQuery(
+                  type = filter.type,
+                  genre = filter.genre,
+                  sort = filter.sort.toCatalogSort(),
+              )
+              val pager = rememberPager(query.type, query.genre, query.sort) { cursor ->
+                  source.catalog(query, cursor)
+              }
 
               LazyVerticalGrid(
                   columns = GridCells.Fixed(3),
@@ -1799,7 +2702,7 @@ jobs:
                           )
                           FilterRow(
                               label = "题材",
-                              options = listOf<String?>(null) + MockCatalog.genres,
+                              options = listOf<String?>(null) + genres,
                               selected = filter.genre,
                               text = { it ?: "全部" },
                               onSelect = { onFilterChange(filter.copy(genre = it)) },
@@ -1811,22 +2714,43 @@ jobs:
                               text = { it.label },
                               onSelect = { onFilterChange(filter.copy(sort = it)) },
                           )
-                          Text("共 ${results.size} 部", fontSize = 13.sp, color = AppColors.TextSecondary)
+                          Text(
+                              "共 ${pager.items.size}${if (pager.hasMore) "+" else ""} 部",
+                              fontSize = 13.sp,
+                              color = AppColors.TextSecondary,
+                          )
                       }
                   }
 
-                  if (results.isEmpty()) {
+                  if (pager.items.isEmpty()) {
                       item(span = { GridItemSpan(maxLineSpan) }) {
-                          EmptyState("没有符合条件的内容，换个筛选试试")
+                          when (val error = pager.error) {
+                              null -> SourceLoading(
+                                  Modifier
+                                      .fillMaxSize()
+                                      .padding(vertical = 40.dp),
+                              )
+                              else -> SourceErrorState(
+                                  error = error,
+                                  onRetry = pager::retry,
+                                  modifier = Modifier.padding(vertical = 24.dp),
+                              )
+                          }
                       }
                   }
 
-                  items(results, key = { it.id }) { d ->
+                  items(pager.items, key = { it.id }) { d ->
                       DramaCard(
                           drama = d,
                           subtitle = if (filter.sort == SortOrder.SCORE) "${d.score}分 · ${d.episodeText}" else d.heatText,
                           onClick = { onOpenDrama(d.id) },
                       )
+                  }
+
+                  if (pager.items.isNotEmpty()) {
+                      item(span = { GridItemSpan(maxLineSpan) }) {
+                          PagerFooter(pager)
+                      }
                   }
               }
           }
@@ -1879,7 +2803,6 @@ jobs:
           import androidx.compose.runtime.Composable
           import androidx.compose.runtime.getValue
           import androidx.compose.runtime.mutableStateOf
-          import androidx.compose.runtime.remember
           import androidx.compose.runtime.saveable.rememberSaveable
           import androidx.compose.runtime.setValue
           import androidx.compose.ui.Alignment
@@ -1892,28 +2815,40 @@ jobs:
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
           import com.shiguang.video.data.Drama
-          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.source.CatalogQuery
+          import com.shiguang.video.data.source.CatalogSort
+          import com.shiguang.video.data.source.collectPages
           import com.shiguang.video.ui.components.Pill
           import com.shiguang.video.ui.components.Poster
+          import com.shiguang.video.ui.components.SourceErrorState
+          import com.shiguang.video.ui.components.SourceLoading
+          import com.shiguang.video.ui.components.SourceState
           import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberContentSource
+          import com.shiguang.video.ui.components.rememberSourceState
           import com.shiguang.video.ui.theme.AppColors
 
-          private enum class RankKind(val label: String) {
-              HOT("热播榜"),
-              SCORE("好评榜"),
-              NEW("新剧榜"),
+          private const val RANK_LIMIT = 15
+
+          private enum class RankKind(val label: String, val sort: CatalogSort) {
+              HOT("热播榜", CatalogSort.HOT),
+              SCORE("好评榜", CatalogSort.SCORE),
+              NEW("新剧榜", CatalogSort.NEWEST),
           }
 
           @Composable
           fun RankScreen(onOpenDrama: (String) -> Unit) {
               var kind by rememberSaveable { mutableStateOf(RankKind.HOT) }
-              val list = remember(kind) {
-                  when (kind) {
-                      RankKind.HOT -> MockCatalog.dramas.sortedByDescending { it.heat }
-                      RankKind.SCORE -> MockCatalog.dramas.sortedByDescending { it.score }
-                      RankKind.NEW -> MockCatalog.dramas.sortedWith(compareBy<Drama> { it.updatedDaysAgo }.thenByDescending { it.heat })
-                  }.take(15)
+              val source = rememberContentSource()
+
+              // 榜单固定只取前 15 名
+              val holder = rememberSourceState(kind) {
+                  collectPages(limit = RANK_LIMIT) { cursor ->
+                      source.catalog(CatalogQuery(sort = kind.sort), cursor)
+                  }
               }
+              val state = holder.state
+              val list = (state as? SourceState.Ready)?.value.orEmpty()
 
               LazyColumn(
                   modifier = Modifier.fillMaxSize(),
@@ -1929,8 +2864,29 @@ jobs:
                           }
                       }
                   }
-                  itemsIndexed(list, key = { _, d -> d.id }) { index, d ->
-                      RankRow(index + 1, d, kind, onClick = { onOpenDrama(d.id) })
+
+                  when (state) {
+                      is SourceState.Loading -> item {
+                          SourceLoading(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .height(200.dp),
+                          )
+                      }
+
+                      is SourceState.Failed -> item {
+                          SourceErrorState(
+                              error = state.error,
+                              onRetry = holder::retry,
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .height(220.dp),
+                          )
+                      }
+
+                      is SourceState.Ready -> itemsIndexed(list, key = { _, d -> d.id }) { index, d ->
+                          RankRow(index + 1, d, kind, onClick = { onOpenDrama(d.id) })
+                      }
                   }
               }
           }
@@ -2043,10 +2999,15 @@ jobs:
           import androidx.lifecycle.compose.collectAsStateWithLifecycle
           import com.shiguang.video.app
           import com.shiguang.video.data.Drama
-          import com.shiguang.video.data.MockCatalog
+          import com.shiguang.video.data.source.collectPages
           import com.shiguang.video.ui.components.EmptyState
           import com.shiguang.video.ui.components.Poster
+          import com.shiguang.video.ui.components.SourceErrorState
+          import com.shiguang.video.ui.components.SourceLoading
+          import com.shiguang.video.ui.components.SourceState
           import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberContentSource
+          import com.shiguang.video.ui.components.rememberSourceState
           import com.shiguang.video.ui.theme.AppColors
 
           @Composable
@@ -2056,8 +3017,19 @@ jobs:
               val history by historyRepo.items.collectAsStateWithLifecycle()
               val keyboard = LocalSoftwareKeyboardController.current
 
+              val source = rememberContentSource()
               var query by rememberSaveable { mutableStateOf("") }
-              val results = remember(query) { MockCatalog.search(query) }
+
+              // 输入即搜；输入框为空时不请求
+              val results = rememberSourceState(query) {
+                  if (query.isBlank()) {
+                      com.shiguang.video.data.source.SourceResult.Ok(emptyList())
+                  } else {
+                      collectPages { cursor -> source.search(query, cursor) }
+                  }
+              }
+              val keywordsState = rememberSourceState { source.hotKeywords() }
+              val keywords = (keywordsState.state as? SourceState.Ready)?.value.orEmpty()
 
               val submit: (String) -> Unit = { q ->
                   query = q
@@ -2077,24 +3049,63 @@ jobs:
                       modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 16.dp, bottom = 8.dp),
                   )
 
-                  when {
-                      query.isBlank() -> SearchSuggestions(
+                  if (query.isBlank()) {
+                      SearchSuggestions(
                           history = history,
+                          keywords = keywords,
                           onPick = submit,
                           onClearHistory = historyRepo::clear,
                       )
-                      results.isEmpty() -> EmptyState("没有找到“$query”相关内容")
-                      else -> LazyColumn(
-                          contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = bottomContentPadding()),
-                          verticalArrangement = Arrangement.spacedBy(14.dp),
-                      ) {
-                          item {
-                              Text("找到 ${results.size} 个结果", fontSize = 13.sp, color = AppColors.TextSecondary)
-                          }
-                          items(results, key = { it.id }) { d ->
-                              SearchResultRow(d, query) {
-                                  historyRepo.add(query)
-                                  onOpenDrama(d.id)
+                  } else {
+                      SearchResults(
+                          query = query,
+                          state = results.state,
+                          onRetry = results::retry,
+                          onOpenDrama = { id ->
+                              historyRepo.add(query)
+                              onOpenDrama(id)
+                          },
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun SearchResults(
+              query: String,
+              state: SourceState<List<Drama>>,
+              onRetry: () -> Unit,
+              onOpenDrama: (String) -> Unit,
+          ) {
+              when (state) {
+                  is SourceState.Loading -> SourceLoading(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(200.dp),
+                  )
+
+                  is SourceState.Failed -> SourceErrorState(
+                      error = state.error,
+                      onRetry = onRetry,
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .height(220.dp),
+                  )
+
+                  is SourceState.Ready -> {
+                      val results = state.value
+                      if (results.isEmpty()) {
+                          EmptyState("没有找到“$query”相关内容")
+                      } else {
+                          LazyColumn(
+                              contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = bottomContentPadding()),
+                              verticalArrangement = Arrangement.spacedBy(14.dp),
+                          ) {
+                              item {
+                                  Text("找到 ${results.size} 个结果", fontSize = 13.sp, color = AppColors.TextSecondary)
+                              }
+                              items(results, key = { it.id }) { d ->
+                                  SearchResultRow(d, query) { onOpenDrama(d.id) }
                               }
                           }
                       }
@@ -2153,6 +3164,7 @@ jobs:
           @Composable
           private fun SearchSuggestions(
               history: List<String>,
+              keywords: List<String>,
               onPick: (String) -> Unit,
               onClearHistory: () -> Unit,
           ) {
@@ -2197,23 +3209,25 @@ jobs:
                       item { Spacer(Modifier.height(8.dp)) }
                   }
 
-                  item { Text("热门搜索", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary) }
-                  itemsIndexed(MockCatalog.hotKeywords) { index, keyword ->
-                      Row(
-                          Modifier
-                              .fillMaxWidth()
-                              .clickable { onPick(keyword) }
-                              .padding(vertical = 4.dp),
-                          verticalAlignment = Alignment.CenterVertically,
-                      ) {
-                          Text(
-                              text = "${index + 1}",
-                              color = if (index < 3) AppColors.Accent else AppColors.TextSecondary,
-                              fontWeight = FontWeight.Bold,
-                              fontSize = 15.sp,
-                              modifier = Modifier.width(28.dp),
-                          )
-                          Text(keyword, color = AppColors.TextPrimary, fontSize = 15.sp)
+                  if (keywords.isNotEmpty()) {
+                      item { Text("热门搜索", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary) }
+                      itemsIndexed(keywords) { index, keyword ->
+                          Row(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .clickable { onPick(keyword) }
+                                  .padding(vertical = 4.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                          ) {
+                              Text(
+                                  text = "${index + 1}",
+                                  color = if (index < 3) AppColors.Accent else AppColors.TextSecondary,
+                                  fontWeight = FontWeight.Bold,
+                                  fontSize = 15.sp,
+                                  modifier = Modifier.width(28.dp),
+                              )
+                              Text(keyword, color = AppColors.TextPrimary, fontSize = 15.sp)
+                          }
                       }
                   }
               }
@@ -2287,6 +3301,7 @@ jobs:
           import androidx.compose.material3.TextButton
           import androidx.compose.runtime.Composable
           import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.remember
           import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.saveable.rememberSaveable
           import androidx.compose.runtime.setValue
@@ -2297,12 +3312,12 @@ jobs:
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
-          import com.shiguang.video.data.TestVideos
           import com.shiguang.video.data.formatDuration
           import com.shiguang.video.ui.components.HistoryItem
           import com.shiguang.video.ui.components.Poster
           import com.shiguang.video.ui.components.ProgressStrip
           import com.shiguang.video.ui.components.bottomContentPadding
+          import com.shiguang.video.ui.components.rememberContentSource
           import com.shiguang.video.ui.components.rememberProgressRepo
           import com.shiguang.video.ui.components.rememberWatchHistory
           import com.shiguang.video.ui.theme.AppColors
@@ -2315,6 +3330,10 @@ jobs:
               val repo = rememberProgressRepo()
               val history = rememberWatchHistory()
               var confirmClear by rememberSaveable { mutableStateOf(false) }
+
+              // 版权说明由数据源提供，换成真实接口后自动变成真实来源
+              val source = rememberContentSource()
+              val info = remember(source) { source.info }
 
               LazyColumn(
                   modifier = Modifier.fillMaxSize(),
@@ -2392,16 +3411,12 @@ jobs:
                               .padding(16.dp),
                           verticalArrangement = Arrangement.spacedBy(6.dp),
                       ) {
-                          Text("关于测试内容", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
+                          Text("关于内容来源", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = AppColors.TextPrimary)
                           Text(
-                              "当前为第一阶段演示版本：片名、简介均为虚构的模拟数据，海报由程序生成。" +
-                                  "播放使用以下开放授权影片：",
+                              text = info?.licenseNote.orEmpty(),
                               fontSize = 12.sp,
                               color = AppColors.TextSecondary,
                           )
-                          TestVideos.all.forEach { v ->
-                              Text("· ${v.credit}", fontSize = 12.sp, color = AppColors.TextSecondary)
-                          }
                       }
                   }
               }
@@ -2536,16 +3551,21 @@ jobs:
           import com.shiguang.video.data.ContentType
           import com.shiguang.video.data.Drama
           import com.shiguang.video.data.DramaProgress
-          import com.shiguang.video.data.MockCatalog
           import com.shiguang.video.data.ProgressPolicy
           import com.shiguang.video.data.formatDuration
+          import com.shiguang.video.data.source.SourceError
           import com.shiguang.video.ui.components.DramaCard
           import com.shiguang.video.ui.components.EmptyState
           import com.shiguang.video.ui.components.Pill
           import com.shiguang.video.ui.components.Poster
           import com.shiguang.video.ui.components.RoundIconButton
           import com.shiguang.video.ui.components.SectionHeader
+          import com.shiguang.video.ui.components.SourceErrorState
+          import com.shiguang.video.ui.components.SourceLoading
+          import com.shiguang.video.ui.components.SourceState
+          import com.shiguang.video.ui.components.rememberContentSource
           import com.shiguang.video.ui.components.rememberProgressRepo
+          import com.shiguang.video.ui.components.rememberSourceState
           import com.shiguang.video.ui.theme.AppColors
 
           private const val EPISODES_PER_PAGE = 30
@@ -2558,29 +3578,65 @@ jobs:
               onPlay: (Int) -> Unit,
               onOpenDrama: (String) -> Unit,
           ) {
-              val drama = remember(dramaId) { MockCatalog.find(dramaId) }
-              if (drama == null) {
-                  Box(Modifier.fillMaxSize().background(AppColors.Background)) {
-                      EmptyState("内容不存在或已下架")
-                      RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onBack, Modifier.statusBarsPadding().padding(12.dp))
-                  }
-                  return
-              }
-
-              val repo = rememberProgressRepo()
-              val all by repo.all.collectAsStateWithLifecycle()
-              val progress = all[drama.id]
-              val continueEpisode = ProgressPolicy.episodeToContinue(progress, drama.episodeCount)
-              val related = remember(drama) { MockCatalog.related(drama) }
-
-              val pages = remember(drama) { (1..drama.episodeCount).chunked(EPISODES_PER_PAGE) }
-              var page by rememberSaveable(drama.id) { mutableIntStateOf((continueEpisode - 1) / EPISODES_PER_PAGE) }
+              val source = rememberContentSource()
+              val holder = rememberSourceState(dramaId) { source.series(dramaId) }
+              val state = holder.state
 
               Box(
                   Modifier
                       .fillMaxSize()
                       .background(AppColors.Background),
               ) {
+                  when (state) {
+                      is SourceState.Loading -> SourceLoading()
+
+                      is SourceState.Failed -> {
+                          if (state.error == SourceError.NotFound) {
+                              EmptyState("内容不存在或已下架")
+                          } else {
+                              SourceErrorState(error = state.error, onRetry = holder::retry)
+                          }
+                      }
+
+                      is SourceState.Ready -> DetailContent(
+                          drama = state.value,
+                          onPlay = onPlay,
+                          onOpenDrama = onOpenDrama,
+                      )
+                  }
+
+                  RoundIconButton(
+                      Icons.AutoMirrored.Filled.ArrowBack,
+                      "返回",
+                      onBack,
+                      Modifier
+                          .statusBarsPadding()
+                          .padding(12.dp),
+                      background = Color.Black.copy(alpha = 0.35f),
+                  )
+              }
+          }
+
+          @Composable
+          private fun DetailContent(
+              drama: Drama,
+              onPlay: (Int) -> Unit,
+              onOpenDrama: (String) -> Unit,
+          ) {
+              val source = rememberContentSource()
+              val relatedHolder = rememberSourceState(drama.id) { source.related(drama.id) }
+              val state = relatedHolder.state
+              val related = (state as? SourceState.Ready)?.value.orEmpty()
+
+              val repo = rememberProgressRepo()
+              val all by repo.all.collectAsStateWithLifecycle()
+              val progress = all[drama.id]
+              val continueEpisode = ProgressPolicy.episodeToContinue(progress, drama.episodeCount)
+
+              val pages = remember(drama.id, drama.episodeCount) { (1..drama.episodeCount).chunked(EPISODES_PER_PAGE) }
+              var page by rememberSaveable(drama.id) { mutableIntStateOf((continueEpisode - 1) / EPISODES_PER_PAGE) }
+
+              Box(Modifier.fillMaxSize()) {
                   LazyColumn(
                       contentPadding = PaddingValues(bottom = 110.dp),
                       verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -2622,7 +3678,7 @@ jobs:
                           }
                       }
 
-                      val pageEpisodes = pages.getOrElse(page) { pages.first() }
+                      val pageEpisodes = pages.getOrElse(page) { pages.firstOrNull().orEmpty() }
                       items(pageEpisodes.chunked(EPISODE_COLUMNS)) { row ->
                           Row(
                               Modifier
@@ -2645,26 +3701,30 @@ jobs:
 
                       item { SectionHeader("猜你喜欢", Modifier.padding(top = 8.dp)) }
                       item {
-                          LazyRow(
-                              contentPadding = PaddingValues(horizontal = 20.dp),
-                              horizontalArrangement = Arrangement.spacedBy(12.dp),
-                          ) {
-                              items(related, key = { it.id }) { d ->
-                                  DramaCard(d, d.heatText, { onOpenDrama(d.id) }, Modifier.width(110.dp))
+                          when (state) {
+                              is SourceState.Loading -> SourceLoading(
+                                  Modifier
+                                      .fillMaxWidth()
+                                      .height(140.dp),
+                              )
+                              is SourceState.Failed -> SourceErrorState(
+                                  error = state.error,
+                                  onRetry = relatedHolder::retry,
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .height(140.dp),
+                              )
+                              is SourceState.Ready -> LazyRow(
+                                  contentPadding = PaddingValues(horizontal = 20.dp),
+                                  horizontalArrangement = Arrangement.spacedBy(12.dp),
+                              ) {
+                                  items(related, key = { it.id }) { d ->
+                                      DramaCard(d, d.heatText, { onOpenDrama(d.id) }, Modifier.width(110.dp))
+                                  }
                               }
                           }
                       }
                   }
-
-                  RoundIconButton(
-                      Icons.AutoMirrored.Filled.ArrowBack,
-                      "返回",
-                      onBack,
-                      Modifier
-                          .statusBarsPadding()
-                          .padding(12.dp),
-                      background = Color.Black.copy(alpha = 0.35f),
-                  )
 
                   PlayBar(
                       drama = drama,
@@ -2679,7 +3739,7 @@ jobs:
           @Composable
           private fun DetailHeader(drama: Drama) {
               Box(Modifier.fillMaxWidth()) {
-                  // 背景：同一张生成海报放大并压暗
+                  // 背景：同一张海报放大并压暗
                   Poster(
                       drama,
                       Modifier
@@ -2850,9 +3910,13 @@ jobs:
           import androidx.media3.common.Player
           import androidx.media3.exoplayer.ExoPlayer
           import com.shiguang.video.data.Drama
-          import com.shiguang.video.data.MockCatalog
           import com.shiguang.video.data.ProgressPolicy
           import com.shiguang.video.data.WatchProgressRepository
+          import com.shiguang.video.data.source.ContentSource
+          import com.shiguang.video.data.source.PlaybackGuard
+          import com.shiguang.video.data.source.SourceResult
+          import com.shiguang.video.data.source.userMessage
+          import kotlinx.coroutines.Job
           import kotlinx.coroutines.delay
           import kotlinx.coroutines.flow.MutableStateFlow
           import kotlinx.coroutines.flow.StateFlow
@@ -2864,18 +3928,24 @@ jobs:
           data class PlayerUiState(
               val episode: Int,
               val autoNext: Boolean = true,
+              /** 正在向数据源取播放地址 */
+              val resolving: Boolean = false,
               val error: String? = null,
               /** 本次是从多少毫秒处续播的，用于给出提示；0 表示从头播放 */
               val resumedFromMs: Long = 0L,
+              /** 片源署名，由数据源提供，按授权要求显示 */
+              val credit: String? = null,
           )
 
           /**
            * 播放器放在 ViewModel 里，横竖屏切换、界面重组都不会打断播放。
+           * 播放地址向 [ContentSource] 获取，加密流、需登录或付费的内容只提示、不绕过。
            * 进度保存时机：每 5 秒、暂停、切集、播完、进入后台、离开页面。
            */
           class PlayerViewModel(
               app: Application,
               private val repo: WatchProgressRepository,
+              private val source: ContentSource,
               val drama: Drama,
               startEpisode: Int,
           ) : AndroidViewModel(app) {
@@ -2895,6 +3965,8 @@ jobs:
               val ui: StateFlow<PlayerUiState> = _ui.asStateFlow()
 
               private val currentEpisode: Int get() = _ui.value.episode
+
+              private var loadJob: Job? = null
 
               private val listener = object : Player.Listener {
                   override fun onPlaybackStateChanged(playbackState: Int) {
@@ -2938,8 +4010,7 @@ jobs:
 
               fun retry() {
                   _ui.update { it.copy(error = null) }
-                  player.prepare()
-                  player.play()
+                  load(currentEpisode)
               }
 
               fun onBackground() {
@@ -2948,23 +4019,46 @@ jobs:
               }
 
               private fun load(number: Int) {
-                  val episode = MockCatalog.episode(drama, number)
+                  loadJob?.cancel()
                   val start = ProgressPolicy.resumePositionMs(repo.episode(drama.id, number))
-                  _ui.update { it.copy(episode = number, error = null, resumedFromMs = start) }
+                  _ui.update { it.copy(episode = number, error = null, resolving = true, resumedFromMs = start) }
 
-                  val item = MediaItem.Builder()
-                      .setUri(episode.video.url)
-                      .setMediaId(mediaId(number))
-                      .setMediaMetadata(
-                          MediaMetadata.Builder()
-                              .setTitle("${drama.title} ${episode.title}")
-                              .build(),
-                      )
-                      .build()
-                  player.setMediaItem(item, start)
-                  player.prepare()
-                  player.playWhenReady = true
+                  loadJob = viewModelScope.launch {
+                      when (val result = source.playback(drama.id, number)) {
+                          is SourceResult.Err -> {
+                              _ui.update { it.copy(resolving = false, error = result.error.userMessage) }
+                          }
+
+                          is SourceResult.Ok -> {
+                              val playback = result.value
+                              when (val stream = PlaybackGuard.selectStream(playback, nowMillis = System.currentTimeMillis())) {
+                                  is SourceResult.Err -> {
+                                      _ui.update { it.copy(resolving = false, error = stream.error.userMessage) }
+                                  }
+
+                                  is SourceResult.Ok -> {
+                                      _ui.update { it.copy(resolving = false, credit = playback.credit) }
+                                      val item = MediaItem.Builder()
+                                          .setUri(stream.value.url)
+                                          .setMediaId(mediaId(number))
+                                          .setMediaMetadata(
+                                              MediaMetadata.Builder()
+                                                  .setTitle("${drama.title} ${episodeTitle(number)}")
+                                                  .build(),
+                                          )
+                                          .build()
+                                      player.setMediaItem(item, start)
+                                      player.prepare()
+                                      player.playWhenReady = true
+                                  }
+                              }
+                          }
+                      }
+                  }
               }
+
+              private fun episodeTitle(number: Int) =
+                  if (drama.type == com.shiguang.video.data.ContentType.MOVIE) "正片" else "第${number}集"
 
               private fun onEnded() {
                   val duration = player.duration
@@ -2987,6 +4081,7 @@ jobs:
 
               override fun onCleared() {
                   saveProgress()
+                  loadJob?.cancel()
                   player.removeListener(listener)
                   player.release()
               }
@@ -3063,11 +4158,16 @@ jobs:
           import com.shiguang.video.data.ContentType
           import com.shiguang.video.data.Drama
           import com.shiguang.video.data.DramaProgress
-          import com.shiguang.video.data.MockCatalog
           import com.shiguang.video.data.formatDuration
+          import com.shiguang.video.data.source.SourceError
           import com.shiguang.video.findActivity
           import com.shiguang.video.ui.components.EmptyState
           import com.shiguang.video.ui.components.RoundIconButton
+          import com.shiguang.video.ui.components.SourceErrorState
+          import com.shiguang.video.ui.components.SourceLoading
+          import com.shiguang.video.ui.components.SourceState
+          import com.shiguang.video.ui.components.rememberContentSource
+          import com.shiguang.video.ui.components.rememberSourceState
           import com.shiguang.video.ui.theme.AppColors
           import kotlinx.coroutines.delay
 
@@ -3077,18 +4177,51 @@ jobs:
               startEpisode: Int,
               onBack: () -> Unit,
           ) {
-              val drama = remember(dramaId) { MockCatalog.find(dramaId) }
-              if (drama == null) {
-                  Box(Modifier.fillMaxSize().background(Color.Black)) {
-                      EmptyState("内容不存在或已下架")
-                      RoundIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onBack, Modifier.statusBarsPadding().padding(12.dp))
-                  }
-                  return
-              }
+              val source = rememberContentSource()
+              val holder = rememberSourceState(dramaId) { source.series(dramaId) }
+              val state = holder.state
 
+              Box(Modifier.fillMaxSize().background(Color.Black)) {
+                  when (state) {
+                      is SourceState.Loading -> SourceLoading()
+
+                      is SourceState.Failed -> {
+                          if (state.error == SourceError.NotFound) {
+                              EmptyState("内容不存在或已下架")
+                          } else {
+                              SourceErrorState(error = state.error, onRetry = holder::retry)
+                          }
+                          RoundIconButton(
+                              Icons.AutoMirrored.Filled.ArrowBack,
+                              "返回",
+                              onBack,
+                              Modifier
+                                  .statusBarsPadding()
+                                  .padding(12.dp),
+                              background = Color.Black.copy(alpha = 0.35f),
+                          )
+                      }
+
+                      is SourceState.Ready -> PlayerContent(
+                          drama = state.value,
+                          startEpisode = startEpisode,
+                          onBack = onBack,
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun PlayerContent(
+              drama: Drama,
+              startEpisode: Int,
+              onBack: () -> Unit,
+          ) {
               val context = LocalContext.current
               val app = context.app
-              val vm: PlayerViewModel = viewModel { PlayerViewModel(app, app.progressRepo, drama, startEpisode) }
+              val vm: PlayerViewModel = viewModel(key = drama.id) {
+                  PlayerViewModel(app, app.progressRepo, app.contentSource, drama, startEpisode)
+              }
               val ui by vm.ui.collectAsStateWithLifecycle()
               val allProgress by app.progressRepo.all.collectAsStateWithLifecycle()
 
@@ -3179,6 +4312,10 @@ jobs:
                           modifier = Modifier.fillMaxSize(),
                       )
 
+                      if (ui.resolving && ui.error == null) {
+                          SourceLoading(Modifier.matchParentSize())
+                      }
+
                       resumeHint?.let { hint ->
                           Text(
                               hint,
@@ -3213,6 +4350,7 @@ jobs:
                           drama = drama,
                           currentEpisode = ui.episode,
                           progress = allProgress[drama.id],
+                          credit = ui.credit,
                           autoNext = ui.autoNext,
                           onAutoNextChange = vm::setAutoNext,
                           onSelect = vm::playEpisode,
@@ -3256,13 +4394,12 @@ jobs:
               drama: Drama,
               currentEpisode: Int,
               progress: DramaProgress?,
+              credit: String?,
               autoNext: Boolean,
               onAutoNextChange: (Boolean) -> Unit,
               onSelect: (Int) -> Unit,
               modifier: Modifier = Modifier,
           ) {
-              val episode = remember(drama, currentEpisode) { MockCatalog.episode(drama, currentEpisode) }
-
               LazyVerticalGrid(
                   columns = GridCells.Fixed(6),
                   modifier = modifier,
@@ -3334,15 +4471,17 @@ jobs:
                       }
                   }
 
-                  item(span = { GridItemSpan(maxLineSpan) }) {
-                      Text(
-                          "测试片源：${episode.video.credit}",
-                          color = AppColors.TextSecondary.copy(alpha = 0.7f),
-                          fontSize = 11.sp,
-                          modifier = Modifier
-                              .padding(top = 12.dp)
-                              .navigationBarsPadding(),
-                      )
+                  if (!credit.isNullOrBlank()) {
+                      item(span = { GridItemSpan(maxLineSpan) }) {
+                          Text(
+                              "片源：$credit",
+                              color = AppColors.TextSecondary.copy(alpha = 0.7f),
+                              fontSize = 11.sp,
+                              modifier = Modifier
+                                  .padding(top = 12.dp)
+                                  .navigationBarsPadding(),
+                          )
+                      }
                   }
               }
           }
@@ -3363,6 +4502,7 @@ jobs:
               -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      # 仓库里没有提交 gradle-wrapper.jar，直接由 setup-gradle 安装指定版本
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.11.1"
@@ -3384,6 +4524,7 @@ jobs:
           name: shiguang-video-apk
           path: dist/*.apk
 
+      # 推送到 main 时发布 Release，手机浏览器可直接下载安装
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
